@@ -1,21 +1,22 @@
 # Dokany
 [![Build status](https://ci.appveyor.com/api/projects/status/4tpt4v8btyahh3le/branch/master?svg=true)](https://ci.appveyor.com/project/Maxhy/dokany/branch/master)
+[![Coverity Scan Build Status](https://scan.coverity.com/projects/6789/badge.svg)](https://scan.coverity.com/projects/6789)
+[![Bounty](https://img.shields.io/bountysource/team/dokan-dev/activity.svg)](https://www.bountysource.com/teams/dokan-dev/issues)
 
 ## What is Dokan
-When you want to create a new file system on Windows, for example to
-improve FAT or NTFS, you need to develop a file system
+When you want to create a new file system on Windows, other than FAT or NTFS, you need to develop a file system
 driver. Developing a device driver that works in kernel mode on
 windows is extremely technical. By using Dokan, you can create
-your own file systems very easily without writing device driver. Dokan
-is similar to FUSE(Linux user mode file system) but works on Windows.
+your own file systems very easily without writing device drivers. Dokan
+is similar to FUSE (Linux file system in user space) but works on Windows.
 
 ## What is Dokany
 *Dokany is a fork of Dokan 0.6.0 with bug fixes, clean change history and updated to build with latest tools.*
 
 Because the original [Dokan](http://dokan-dev.net/en/docs/) project is no longer maintained.
 
-Because other forks like [DokanX](https://github.com/BenjaminKim/dokanx) has undesired changes or not really maintained.
-
+Since version 0.8.0, dokany break dokan API compatibility.
+See [Choose a version](https://github.com/dokan-dev/dokany/wiki/Installation#choose-a-version) for more informations.
 
 **Signed x86 / x64 drivers** are provided at each release.
 
@@ -39,14 +40,12 @@ You can obtain source files from https://dokan-dev.github.io
 
 ## Environment
 Dokan works on
+ * Windows 10
  * Windows 8.1
  * Windows Server 2012 R2
  * Windows 8
  * Windows Server 2012
  * Windows 7
- * Windows Server 2008 R2
- * Windows Vista
- * Windows Server 2008
 
 ## How it works
 Dokan library contains a user mode DLL (dokan.dll) and a kernel mode
@@ -78,7 +77,7 @@ easy to debug.
 To learn more about Dokan file system development, see the [API documentation](https://github.com/dokan-dev/dokany/wiki/API).
 
 ## Build
-In short, download and install the [Visual Studio 2013 with WDK 8.1 Update](https://msdn.microsoft.com/en-us/windows/hardware/gg454513.aspx)
+In short, download and install the [Visual Studio 2015](https://www.visualstudio.com/en-us/downloads/download-visual-studio-vs.aspx) with [SDK 10](https://dev.windows.com/en-us/downloads/windows-10-sdk) & [WDK 10](https://msdn.microsoft.com/en-us/windows/hardware/dn913721.aspx)
 
 For details, see the [build page](https://github.com/dokan-dev/dokany/wiki/Build).
 
@@ -89,8 +88,8 @@ For manual installation, see the [installation page](https://github.com/dokan-de
 You want Dokan to get better? Contribute!
 
 
-Learn the code and suggest your changes on [Dokan git repository](https://github.com/dokan-dev).
+Learn the code and suggest your changes on [GitHub repository](https://github.com/dokan-dev).
 
-Detect defects and report them on [Dokan issue tracker](https://github.com/dokan-dev/dokany/issues).
+Detect defects and report them on [GitHub issue tracker](https://github.com/dokan-dev/dokany/issues).
 
-Ask and answer questions on [Dokan discussion group](https://groups.google.com/forum/#!forum/dokan).
+Ask and answer questions on [Google discussion group](https://groups.google.com/forum/#!forum/dokan).

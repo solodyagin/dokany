@@ -36,7 +36,7 @@ struct impl_chain_link
 {
 	impl_chain_link *prev_link_;
 	fuse_context call_ctx_;
-	impl_chain_link() { memset(&call_ctx_, 0, sizeof(call_ctx_)); }
+	impl_chain_link() : prev_link_(nullptr) { memset(&call_ctx_, 0, sizeof(call_ctx_)); }
 };
 
 /*
@@ -55,7 +55,7 @@ public:
 class win_error
 {
 public:
-	win_error(int _err): err(errno_to_win32_error(_err)) {}
+	win_error(int _err): err(errno_to_ntstatus_error(_err)) {}
 	win_error(int _err, bool): err(_err) {}
 	operator int() { return err; }
 private:
@@ -176,7 +176,9 @@ public:
 		LPWSTR file_system_name_buffer, DWORD file_system_name_size, 
 		PDOKAN_FILE_INFO dokan_file_info, LPDWORD volume_flags);
 
-	int unmount(PDOKAN_FILE_INFO DokanFileInfo);
+	int mounted(PDOKAN_FILE_INFO DokanFileInfo);
+
+	int unmounted(PDOKAN_FILE_INFO DokanFileInfo);
 };
 
 
