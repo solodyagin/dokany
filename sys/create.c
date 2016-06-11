@@ -1,9 +1,10 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2008 Hiroki Asakawa info@dokan-dev.net
+  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
-  http://dokan-dev.net/en
+  http://dokan-dev.github.io
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the Free
@@ -26,7 +27,7 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 
 // We must NOT call without VCB lock
 PDokanFCB DokanAllocateFCB(__in PDokanVCB Vcb) {
-  PDokanFCB fcb = ExAllocatePool(sizeof(DokanFCB));
+  PDokanFCB fcb = ExAllocateFromLookasideListEx(&g_DokanFCBLookasideList);
 
   if (fcb == NULL) {
     return NULL;
@@ -66,8 +67,7 @@ PDokanFCB DokanAllocateFCB(__in PDokanVCB Vcb) {
   fcb->AdvancedFCBHeader.FileSize.QuadPart = 4096;
 
   fcb->AdvancedFCBHeader.IsFastIoPossible = FastIoIsNotPossible;
-
-  FsRtlInitializeOplock(&(fcb->Oplock));
+  FsRtlInitializeOplock(DokanGetFcbOplock(fcb));
 
   ExInitializeResourceLite(&fcb->Resource);
 
@@ -162,14 +162,14 @@ DokanFreeFCB(__in PDokanFCB Fcb) {
 
   InterlockedDecrement(&Fcb->FileCount);
 
-  FsRtlUninitializeOplock(&(Fcb->Oplock));
-
   if (Fcb->FileCount == 0) {
 
     RemoveEntryList(&Fcb->NextFCB);
 
     DDbgPrint("  Free FCB:%p\n", Fcb);
     ExFreePool(Fcb->FileName.Buffer);
+
+    FsRtlUninitializeOplock(DokanGetFcbOplock(Fcb));
 
 #if _WIN32_WINNT >= 0x0501
     FsRtlTeardownPerStreamContexts(&Fcb->AdvancedFCBHeader);
@@ -185,7 +185,7 @@ DokanFreeFCB(__in PDokanFCB Fcb) {
     ExDeleteResourceLite(&Fcb->PagingIoResource);
 
     InterlockedIncrement(&vcb->FcbFreed);
-    ExFreePool(Fcb);
+    ExFreeToLookasideListEx(&g_DokanFCBLookasideList, Fcb);
 
   } else {
     ExReleaseResourceLite(&Fcb->Resource);
@@ -198,7 +198,7 @@ DokanFreeFCB(__in PDokanFCB Fcb) {
 }
 
 PDokanCCB DokanAllocateCCB(__in PDokanDCB Dcb, __in PDokanFCB Fcb) {
-  PDokanCCB ccb = ExAllocatePool(sizeof(DokanCCB));
+  PDokanCCB ccb = ExAllocateFromLookasideListEx(&g_DokanCCBLookasideList);
 
   if (ccb == NULL)
     return NULL;
@@ -253,7 +253,7 @@ DokanFreeCCB(__in PDokanCCB ccb) {
     ExFreePool(ccb->SearchPattern);
   }
 
-  ExFreePool(ccb);
+  ExFreeToLookasideListEx(&g_DokanCCBLookasideList, ccb);
   InterlockedIncrement(&fcb->Vcb->CcbFreed);
 
   return STATUS_SUCCESS;
@@ -276,37 +276,83 @@ VOID SetFileObjectForVCB(__in PFILE_OBJECT FileObject, __in PDokanVCB Vcb) {
 }
 
 NTSTATUS
+DokanCheckShareAccess(_In_ PFILE_OBJECT FileObject, _In_ PDokanFCB FcbOrDcb,
+                      _In_ ACCESS_MASK DesiredAccess, _In_ ULONG ShareAccess)
+
+/*++
+Routine Description:
+This routine checks conditions that may result in a sharing violation.
+Arguments:
+FileObject - Pointer to the file object of the current open request.
+FcbOrDcb - Supplies a pointer to the Fcb/Dcb.
+DesiredAccess - Desired access of current open request.
+ShareAccess - Shared access requested by current open request.
+Return Value:
+If the accessor has access to the file, STATUS_SUCCESS is returned.
+Otherwise, STATUS_SHARING_VIOLATION is returned.
+
+--*/
+
+{
+  PAGED_CODE();
+
+#if (NTDDI_VERSION >= NTDDI_VISTA)
+  //
+  //  Do an extra test for writeable user sections if the user did not allow
+  //  write sharing - this is neccessary since a section may exist with no
+  //  handles
+  //  open to the file its based against.
+  //
+  if ((FcbOrDcb->Identifier.Type == FCB) &&
+      !FlagOn(ShareAccess, FILE_SHARE_WRITE) &&
+      FlagOn(DesiredAccess, FILE_EXECUTE | FILE_READ_DATA | FILE_WRITE_DATA |
+                                FILE_APPEND_DATA | DELETE | MAXIMUM_ALLOWED) &&
+      MmDoesFileHaveUserWritableReferences(&FcbOrDcb->SectionObjectPointers)) {
+
+    DDbgPrint("  DokanCheckShareAccess FCB has no write shared access\n");
+    return STATUS_SHARING_VIOLATION;
+  }
+#endif
+
+  //
+  //  Check if the Fcb has the proper share access.
+  //
+  return IoCheckShareAccess(DesiredAccess, ShareAccess, FileObject,
+                            &FcbOrDcb->ShareAccess, TRUE);
+}
+
+NTSTATUS
 DokanDispatchCreate(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp)
 
 /*++
 
 Routine Description:
 
-        This device control dispatcher handles create & close IRPs.
+                This device control dispatcher handles create & close IRPs.
 
 Arguments:
 
-        DeviceObject - Context for the activity.
-        Irp 		 - The device control argument block.
+                DeviceObject - Context for the activity.
+                Irp 		 - The device control argument block.
 
 Return Value:
 
-        NTSTATUS
+                NTSTATUS
 
 --*/
 {
-  PDokanVCB vcb;
-  PDokanDCB dcb;
+  PDokanVCB vcb = NULL;
+  PDokanDCB dcb = NULL;
   PIO_STACK_LOCATION irpSp;
   NTSTATUS status = STATUS_INVALID_PARAMETER;
-  PFILE_OBJECT fileObject;
+  PFILE_OBJECT fileObject = NULL;
   ULONG info = 0;
   PEVENT_CONTEXT eventContext;
   PFILE_OBJECT relatedFileObject;
   ULONG fileNameLength = 0;
   ULONG eventLength;
-  PDokanFCB fcb;
-  PDokanCCB ccb;
+  PDokanFCB fcb = NULL;
+  PDokanCCB ccb = NULL;
   PWCHAR fileName = NULL;
   BOOLEAN needBackSlashAfterRelatedFile = FALSE;
   ULONG securityDescriptorSize = 0;
@@ -318,6 +364,8 @@ Return Value:
   PDOKAN_UNICODE_STRING_INTERMEDIATE intermediateUnicodeStr = NULL;
   PUNICODE_STRING relatedFileName = NULL;
   PSECURITY_DESCRIPTOR newFileSecurityDescriptor = NULL;
+  BOOLEAN OpenRequiringOplock = FALSE;
+  //BOOLEAN UnwindShareAccess = FALSE;
 
   PAGED_CODE();
 
@@ -339,13 +387,47 @@ Return Value:
     DDbgPrint("  FileName:%wZ\n", &fileObject->FileName);
 
     vcb = DeviceObject->DeviceExtension;
+    if (vcb == NULL) {
+      DDbgPrint("  No device extension\n");
+      status = STATUS_SUCCESS;
+      __leave;
+    }
+
     PrintIdType(vcb);
+
+    if (GetIdentifierType(vcb) == DCB) {
+      dcb = DeviceObject->DeviceExtension;
+      if (!dcb->Mounted) {
+        DDbgPrint("  IdentifierType is dcb which is not mounted\n");
+        status = STATUS_VOLUME_DISMOUNTED;
+        __leave;
+      }
+    }
+
     if (GetIdentifierType(vcb) != VCB) {
       DDbgPrint("  IdentifierType is not vcb\n");
       status = STATUS_SUCCESS;
       __leave;
     }
     dcb = vcb->Dcb;
+
+    BOOLEAN isNetworkFileSystem =
+        (dcb->VolumeDeviceType == FILE_DEVICE_NETWORK_FILE_SYSTEM);
+
+    if (!isNetworkFileSystem) {
+      if (relatedFileObject != NULL) {
+        fileObject->Vpb = relatedFileObject->Vpb;
+      } else {
+        fileObject->Vpb = dcb->DeviceObject->Vpb;
+      }
+    }
+
+    if (!vcb->HasEventWait) {
+      DDbgPrint("  Here we only go in if some antivirus software tries to "
+                "create files before startup is finished.\n");
+      status = STATUS_SUCCESS;
+      __leave;
+    }
 
     DDbgPrint("  IrpSp->Flags = %d\n", irpSp->Flags);
     if (irpSp->Flags & SL_CASE_SENSITIVE) {
@@ -370,12 +452,6 @@ Return Value:
       RtlMoveMemory(&fileObject->FileName.Buffer[0],
                     &fileObject->FileName.Buffer[1],
                     fileObject->FileName.Length);
-    }
-
-    if (relatedFileObject != NULL) {
-      fileObject->Vpb = relatedFileObject->Vpb;
-    } else {
-      fileObject->Vpb = dcb->DeviceObject->Vpb;
     }
 
     // Get RelatedFileObject filename.
@@ -547,6 +623,8 @@ Return Value:
 
           securityDescriptorSize = PointerAlignSize(
               RtlLengthSecurityDescriptor(newFileSecurityDescriptor));
+        } else {
+          newFileSecurityDescriptor = NULL;
         }
       }
 
@@ -667,7 +745,7 @@ Return Value:
                  alignedObjectTypeNameSize) -
                 (char *)&eventContext->Operation.Create);
 
-    if (newFileSecurityDescriptor) {
+    if (newFileSecurityDescriptor != NULL) {
       // Copy security descriptor
       RtlCopyMemory((char *)eventContext + alignedEventContextSize,
                     newFileSecurityDescriptor,
@@ -736,10 +814,198 @@ Return Value:
               eventContext->Operation.Create.FileNameOffset +
               fcb->FileName.Length) = 0;
 
+//
+// Oplock
+//
+
+#if (NTDDI_VERSION >= NTDDI_WIN7)
+    OpenRequiringOplock = BooleanFlagOn(irpSp->Parameters.Create.Options,
+                                        FILE_OPEN_REQUIRING_OPLOCK);
+#else
+    OpenRequiringOplock = FALSE;
+#endif
+
+    /*
+    // Share access support
+    // WARNING: this implementation is incomplete and can result to unexcepted
+STATUS_SHARING_VIOLATION results
+
+    if (fcb->FileCount > 1) {
+            //
+            //  Check if the Fcb has the proper share access.  This routine will
+also
+            //  check for writable user sections if the user did not allow write
+sharing.
+            //
+            if (!NT_SUCCESS(status = DokanCheckShareAccess(fileObject,
+                    fcb,
+                    eventContext->Operation.Create.SecurityContext.DesiredAccess,
+                    eventContext->Operation.Create.ShareAccess))) {
+
+                    DDbgPrint("   DokanCheckShareAccess failed with 0x%x\n",
+status);
+
+#if (NTDDI_VERSION >= NTDDI_WIN7)
+
+                    NTSTATUS OplockBreakStatus = STATUS_SUCCESS;
+
+                    //
+                    //  If we got a sharing violation try to break outstanding
+handle
+                    //  oplocks and retry the sharing check.  If the caller
+specified
+                    //  FILE_COMPLETE_IF_OPLOCKED we don't bother breaking the
+oplock;
+                    //  we just return the sharing violation.
+                    //
+                    if ((status == STATUS_SHARING_VIOLATION) &&
+                            !FlagOn(irpSp->Parameters.Create.Options,
+FILE_COMPLETE_IF_OPLOCKED)) {
+
+                            OplockBreakStatus =
+FsRtlOplockBreakH(DokanGetFcbOplock(fcb),
+                                    Irp,
+                                    0,
+                                    eventContext,
+                                    DokanOplockComplete,
+                                    DokanPrePostIrp);
+
+                            //
+                            //  If FsRtlOplockBreakH returned STATUS_PENDING,
+then the IRP
+                            //  has been posted and we need to stop working.
+                            //
+                            if (OplockBreakStatus == STATUS_PENDING) {
+                                    DDbgPrint("   FsRtlOplockBreakH returned
+STATUS_PENDING\n");
+                                    status = STATUS_PENDING;
+                                    __leave;
+                                    //
+                                    //  If FsRtlOplockBreakH returned an error
+we want to return that now.
+                                    //
+                            }
+                            else if (!NT_SUCCESS(OplockBreakStatus)) {
+                                    DDbgPrint("   FsRtlOplockBreakH returned
+0x%x\n", OplockBreakStatus);
+                                    status = OplockBreakStatus;
+                                    __leave;
+
+                                    //
+                                    //  Otherwise FsRtlOplockBreakH returned
+STATUS_SUCCESS, indicating
+                                    //  that there is no oplock to be broken.
+The sharing violation is
+                                    //  returned in that case.
+                                    //
+                            }
+                            else {
+                                    NT_ASSERT(OplockBreakStatus ==
+STATUS_SUCCESS);
+                                    __leave;
+                            }
+
+                            //
+                            //  The initial sharing check failed with something
+other than sharing
+                            //  violation (which should never happen, but let's
+be future-proof),
+                            //  or we *did* get a sharing violation and the
+caller specified
+                            //  FILE_COMPLETE_IF_OPLOCKED.  Either way this
+create is over.
+                            //
+
+                    }
+                    else {
+                            __leave;
+                    }
+
+#else
+                    return status;
+#endif
+            }
+    } else {
+            IoSetShareAccess(eventContext->Operation.Create.SecurityContext.DesiredAccess,
+                    eventContext->Operation.Create.ShareAccess,
+                    fileObject,
+                    &fcb->ShareAccess);
+    }
+
+    UnwindShareAccess = TRUE;*/
+
+    //  Now check that we can continue based on the oplock state of the
+    //  file.  If there are no open handles yet in addition to this new one
+    //  we don't need to do this check; oplocks can only exist when there are
+    //  handles.
+    //
+    //  It is important that we modified the DesiredAccess in place so
+    //  that the Oplock check proceeds against any added access we had
+    //  to give the caller.
+    //
+    if (fcb->FileCount > 1) {
+      status = FsRtlCheckOplock(DokanGetFcbOplock(fcb), Irp, eventContext,
+                                DokanOplockComplete, DokanPrePostIrp);
+
+      //
+      //  if FsRtlCheckOplock returns STATUS_PENDING the IRP has been posted
+      //  to service an oplock break and we need to leave now.
+      //
+      if (status == STATUS_PENDING) {
+        DDbgPrint("   FsRtlCheckOplock returned STATUS_PENDING\n");
+        __leave;
+      }
+    }
+
+    if (OpenRequiringOplock) {
+      DDbgPrint("   OpenRequiringOplock\n");
+      //
+      //  If the caller wants atomic create-with-oplock semantics, tell
+      //  the oplock package.
+      if ((status == STATUS_SUCCESS)) {
+        status = FsRtlOplockFsctrl(DokanGetFcbOplock(fcb), Irp, fcb->FileCount);
+      }
+
+      //
+      //  If we've encountered a failure we need to leave.  FsRtlCheckOplock
+      //  will have returned STATUS_OPLOCK_BREAK_IN_PROGRESS if it initiated
+      //  and oplock break and the caller specified FILE_COMPLETE_IF_OPLOCKED
+      //  on the create call.  That's an NT_SUCCESS code, so we need to keep
+      //  going.
+      //
+      if ((status != STATUS_SUCCESS) &&
+          (status != STATUS_OPLOCK_BREAK_IN_PROGRESS)) {
+        DDbgPrint("   FsRtlOplockFsctrl failed with 0x%x\n", status);
+        __leave;
+      }
+    }
+
     // register this IRP to waiting IPR list
     status = DokanRegisterPendingIrp(DeviceObject, Irp, eventContext, 0);
 
   } __finally {
+
+#if (NTDDI_VERSION >= NTDDI_WIN7)
+    //
+    //  If we're not getting out with success, and if the caller wanted
+    //  atomic create-with-oplock semantics make sure we back out any
+    //  oplock that may have been granted.
+    //
+    if (AbnormalTermination() || !NT_SUCCESS(status)) {
+      if (OpenRequiringOplock && (status != STATUS_CANNOT_BREAK_OPLOCK) &&
+          (fcb != NULL)) {
+        FsRtlCheckOplockEx(DokanGetFcbOplock(fcb), Irp,
+                           OPLOCK_FLAG_BACK_OUT_ATOMIC_OPLOCK, NULL, NULL,
+                           NULL);
+      }
+
+      /*
+	  if (UnwindShareAccess) {
+        IoRemoveShareAccess(fileObject, &fcb->ShareAccess);
+      }
+	  */
+    }
+#endif
 
     DokanCompleteIrpRequest(Irp, status, info);
 
@@ -851,13 +1117,11 @@ VOID DokanCompleteCreate(__in PIRP_ENTRY IrpEntry,
   } else {
     DDbgPrint("   IRP_MJ_CREATE failed. Free CCB:%p\n", ccb);
     DokanFreeCCB(ccb);
+    IoRemoveShareAccess(irpSp->FileObject, &fcb->ShareAccess);
     DokanFreeFCB(fcb);
   }
 
-  irp->IoStatus.Status = status;
-  irp->IoStatus.Information = info;
-  IoCompleteRequest(irp, IO_NO_INCREMENT);
+  DokanCompleteIrpRequest(irp, status, info);
 
-  DokanPrintNTStatus(status);
   DDbgPrint("<== DokanCompleteCreate\n");
 }

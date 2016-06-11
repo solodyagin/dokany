@@ -1,9 +1,10 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2008 Hiroki Asakawa info@dokan-dev.net
+  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
-  http://dokan-dev.net/en
+  http://dokan-dev.github.io
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the Free
@@ -49,6 +50,7 @@ Return Value:
   PDokanCCB ccb;
   PDokanFCB fcb;
   PDokanVCB vcb;
+  PVOID currentAddress = NULL;
   PEVENT_CONTEXT eventContext;
   ULONG eventLength;
 
@@ -59,16 +61,48 @@ Return Value:
     irpSp = IoGetCurrentIrpStackLocation(Irp);
     fileObject = irpSp->FileObject;
 
+    //
+    //  If this is a zero length read then return SUCCESS immediately.
+    //
+    if (irpSp->Parameters.Read.Length == 0) {
+      DDbgPrint("  Parameters.Read.Length == 0 \n");
+      status = STATUS_SUCCESS;
+      __leave;
+    }
+
+    if (irpSp->MinorFunction == IRP_MN_COMPLETE) {
+      Irp->MdlAddress = NULL;
+      status = STATUS_SUCCESS;
+      __leave;
+    }
+
+    if (fileObject == NULL && Irp->MdlAddress != NULL) {
+      DDbgPrint("  Reads by File System Recognizers\n");
+
+      currentAddress =
+          MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
+      if (currentAddress == NULL) {
+        status = STATUS_INSUFFICIENT_RESOURCES;
+        __leave;
+      }
+
+      // here we could return the bootsector. If we don't have one
+      // the requested read lenght must be returned as requested
+      readLength = irpSp->Parameters.Read.Length;
+      status = STATUS_SUCCESS;
+      __leave;
+    }
+
     if (fileObject == NULL) {
       DDbgPrint("  fileObject == NULL\n");
-      status = STATUS_INVALID_PARAMETER;
+      status = STATUS_INVALID_DEVICE_REQUEST;
       __leave;
     }
 
     vcb = DeviceObject->DeviceExtension;
     if (GetIdentifierType(vcb) != VCB ||
         !DokanCheckCCB(vcb->Dcb, fileObject->FsContext2)) {
-      status = STATUS_INVALID_PARAMETER;
+      status = STATUS_INVALID_DEVICE_REQUEST;
       __leave;
     }
 
@@ -156,6 +190,33 @@ Return Value:
     eventContext->Operation.Read.FileNameLength = fcb->FileName.Length;
     RtlCopyMemory(eventContext->Operation.Read.FileName, fcb->FileName.Buffer,
                   fcb->FileName.Length);
+
+    //
+    //  We now check whether we can proceed based on the state of
+    //  the file oplocks.
+    //
+    if (!FlagOn(Irp->Flags, IRP_PAGING_IO)) {
+      status = FsRtlCheckOplock(DokanGetFcbOplock(fcb), Irp, eventContext,
+                                DokanOplockComplete, DokanPrePostIrp);
+
+      //
+      //  if FsRtlCheckOplock returns STATUS_PENDING the IRP has been posted
+      //  to service an oplock break and we need to leave now.
+      //
+      if (status == STATUS_PENDING) {
+        DDbgPrint("   FsRtlCheckOplock returned STATUS_PENDING\n");
+        __leave;
+      }
+
+      //
+      // We have to check for read access according to the current
+      // state of the file locks, and set FileSize from the Fcb.
+      //
+      if (!FsRtlCheckLockForReadAccess(&fcb->FileLock, Irp)) {
+        status = STATUS_FILE_LOCK_CONFLICT;
+        __leave;
+      }
+    }
 
     // register this IRP to pending IPR list and make it pending status
     status = DokanRegisterPendingIrp(DeviceObject, Irp, eventContext, 0);

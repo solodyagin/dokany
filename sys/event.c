@@ -1,9 +1,10 @@
-/*I
+/*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2008 Hiroki Asakawa info@dokan-dev.net
+  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
-  http://dokan-dev.net/en
+  http://dokan-dev.github.io
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the Free
@@ -86,6 +87,63 @@ VOID DokanIrpCancelRoutine(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
   return;
 }
 
+VOID DokanOplockComplete(IN PVOID Context, IN PIRP Irp)
+/*++
+Routine Description:
+This routine is called by the oplock package when an oplock break has
+completed, allowing an Irp to resume execution.  If the status in
+the Irp is STATUS_SUCCESS, then we queue the Irp to the Fsp queue.
+Otherwise we complete the Irp with the status in the Irp.
+Arguments:
+Context - Pointer to the EventContext to be queued to the Fsp
+Irp - I/O Request Packet.
+Return Value:
+None.
+--*/
+{
+  PIO_STACK_LOCATION irpSp;
+
+  DDbgPrint("==> DokanOplockComplete\n");
+  PAGED_CODE();
+
+  irpSp = IoGetCurrentIrpStackLocation(Irp);
+
+  //
+  //  Check on the return value in the Irp.
+  //
+  if (Irp->IoStatus.Status == STATUS_SUCCESS) {
+    DokanRegisterPendingIrp(irpSp->DeviceObject, Irp, (PEVENT_CONTEXT)Context,
+                            0);
+  } else {
+    DokanCompleteIrpRequest(Irp, Irp->IoStatus.Status, 0);
+  }
+
+  DDbgPrint("<== DokanOplockComplete\n");
+
+  return;
+}
+
+VOID DokanPrePostIrp(IN PVOID Context, IN PIRP Irp)
+/*++
+Routine Description:
+This routine performs any neccessary work before STATUS_PENDING is
+returned with the Fsd thread.  This routine is called within the
+filesystem and by the oplock package.
+Arguments:
+Context - Pointer to the EventContext to be queued to the Fsp
+Irp - I/O Request Packet.
+Return Value:
+None.
+--*/
+{
+  DDbgPrint("==> DokanPrePostIrp\n");
+
+  UNREFERENCED_PARAMETER(Context);
+  UNREFERENCED_PARAMETER(Irp);
+
+  DDbgPrint("<== DokanPrePostIrp\n");
+}
+
 NTSTATUS
 RegisterPendingIrpMain(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp,
                        __in ULONG SerialNumber, __in PIRP_LIST IrpList,
@@ -128,7 +186,9 @@ RegisterPendingIrpMain(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp,
 
   // Update the irp timeout for the entry
   if (vcb) {
+    ExAcquireResourceExclusiveLite(&vcb->Dcb->Resource, TRUE);
     DokanUpdateTimeout(&irpEntry->TickCount, vcb->Dcb->IrpTimeout);
+    ExReleaseResourceLite(&vcb->Dcb->Resource);
   } else {
     DokanUpdateTimeout(&irpEntry->TickCount, DOKAN_IRP_PENDING_TIMEOUT);
   }
@@ -205,6 +265,7 @@ DokanRegisterPendingIrpForEvent(__in PDEVICE_OBJECT DeviceObject,
   }
 
   // DDbgPrint("DokanRegisterPendingIrpForEvent\n");
+  vcb->HasEventWait = TRUE;
 
   return RegisterPendingIrpMain(DeviceObject, Irp,
                                 0, // SerialNumber
@@ -322,7 +383,7 @@ DokanCompleteIrp(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
       DokanCompleteQueryInformation(irpEntry, eventInfo);
       break;
     case IRP_MJ_QUERY_VOLUME_INFORMATION:
-      DokanCompleteQueryVolumeInformation(irpEntry, eventInfo);
+      DokanCompleteQueryVolumeInformation(irpEntry, eventInfo, DeviceObject);
       break;
     case IRP_MJ_CREATE:
       DokanCompleteCreate(irpEntry, eventInfo);
@@ -377,11 +438,14 @@ DokanEventStart(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
   PDokanDCB dcb;
   NTSTATUS status;
   DEVICE_TYPE deviceType;
-  ULONG deviceCharacteristics;
+  ULONG deviceCharacteristics = 0;
   WCHAR baseGuidString[64];
   GUID baseGuid = DOKAN_BASE_GUID;
   UNICODE_STRING unicodeGuid;
   ULONG deviceNamePos;
+  BOOLEAN useMountManager = FALSE;
+  BOOLEAN mountGlobally = TRUE;
+  BOOLEAN fileLockUserMode = FALSE;
 
   DDbgPrint("==> DokanEventStart\n");
 
@@ -412,8 +476,6 @@ DokanEventStart(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
     return STATUS_SUCCESS;
   }
 
-  deviceCharacteristics = FILE_DEVICE_IS_MOUNTED;
-
   switch (eventStart.DeviceType) {
   case DOKAN_DISK_FILE_SYSTEM:
     deviceType = FILE_DEVICE_DISK_FILE_SYSTEM;
@@ -437,6 +499,21 @@ DokanEventStart(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
     deviceCharacteristics |= FILE_READ_ONLY_DEVICE;
   }
 
+  if (eventStart.Flags & DOKAN_EVENT_MOUNT_MANAGER) {
+    DDbgPrint("  Using Mount Manager\n");
+    useMountManager = TRUE;
+  }
+
+  if (eventStart.Flags & DOKAN_EVENT_CURRENT_SESSION) {
+    DDbgPrint("  Mounting on current session only\n");
+    mountGlobally = FALSE;
+  }
+
+  if (eventStart.Flags & DOKAN_EVENT_FILELOCK_USER_MODE) {
+    DDbgPrint("  FileLock in User Mode\n");
+    fileLockUserMode = TRUE;
+  }
+
   baseGuid.Data2 = (USHORT)(dokanGlobal->MountId & 0xFFFF) ^ baseGuid.Data2;
   baseGuid.Data3 = (USHORT)(dokanGlobal->MountId >> 16) ^ baseGuid.Data3;
 
@@ -455,14 +532,17 @@ DokanEventStart(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
   ExAcquireResourceExclusiveLite(&dokanGlobal->Resource, TRUE);
 
   status = DokanCreateDiskDevice(
-      DeviceObject->DriverObject, dokanGlobal->MountId, baseGuidString,
-      dokanGlobal, deviceType, deviceCharacteristics, &dcb);
+      DeviceObject->DriverObject, dokanGlobal->MountId, eventStart.MountPoint,
+      eventStart.UNCName, baseGuidString, dokanGlobal, deviceType,
+      deviceCharacteristics, mountGlobally, useMountManager, &dcb);
 
   if (!NT_SUCCESS(status)) {
     ExReleaseResourceLite(&dokanGlobal->Resource);
     KeLeaveCriticalRegion();
     return status;
   }
+
+  dcb->FileLockInUserMode = fileLockUserMode;
 
   DDbgPrint("  MountId:%d\n", dcb->MountId);
   driverInfo->DeviceNumber = dokanGlobal->MountId;
@@ -496,17 +576,14 @@ DokanEventStart(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
   }
 
   DDbgPrint("  DeviceName:%ws\n", driverInfo->DeviceName);
-  DokanUpdateTimeout(&dcb->TickCount, DOKAN_KEEPALIVE_TIMEOUT);
 
   dcb->UseAltStream = 0;
   if (eventStart.Flags & DOKAN_EVENT_ALTERNATIVE_STREAM_ON) {
     DDbgPrint("  ALT_STREAM_ON\n");
     dcb->UseAltStream = 1;
   }
-  dcb->Mounted = 1;
 
   DokanStartEventNotificationThread(dcb);
-  DokanStartCheckThread(dcb);
 
   ExReleaseResourceLite(&dokanGlobal->Resource);
   KeLeaveCriticalRegion();

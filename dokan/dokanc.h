@@ -1,9 +1,10 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2008 Hiroki Asakawa info@dokan-dev.net
+  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
-  http://dokan-dev.net/en
+  http://dokan-dev.github.io
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the Free
@@ -18,8 +19,8 @@ You should have received a copy of the GNU Lesser General Public License along
 with this program. If not, see <http://www.gnu.org/licenses/>.
 */
 
-#ifndef _DOKANC_H_
-#define _DOKANC_H_
+#ifndef DOKANC_H_
+#define DOKANC_H_
 
 #include "dokan.h"
 #include <malloc.h>
@@ -28,17 +29,9 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 extern "C" {
 #endif
 
-#define DOKAN_GLOBAL_DEVICE_NAME L"\\\\.\\Dokan"
-#define DOKAN_CONTROL_PIPE L"\\\\.\\pipe\\DokanMounter"
+#define DOKAN_GLOBAL_DEVICE_NAME L"\\\\.\\Dokan" DOKAN_MAJOR_API_VERSION
 
-#define DOKAN_MOUNTER_SERVICE L"DokanMounter"
-#define DOKAN_DRIVER_SERVICE L"Dokan"
-
-#define DOKAN_CONTROL_MOUNT 1
-#define DOKAN_CONTROL_UNMOUNT 2
-#define DOKAN_CONTROL_CHECK 3
-#define DOKAN_CONTROL_FIND 4
-#define DOKAN_CONTROL_LIST 5
+#define DOKAN_DRIVER_SERVICE L"Dokan" DOKAN_MAJOR_API_VERSION
 
 #define DOKAN_CONTROL_OPTION_FORCE_UNMOUNT 1
 
@@ -59,14 +52,7 @@ extern BOOL g_DebugMode;
 // DokanOptions->UseStdErr is ON?
 extern BOOL g_UseStdErr;
 
-typedef struct _DOKAN_CONTROL {
-  ULONG Type;
-  WCHAR MountPoint[MAX_PATH];
-  WCHAR DeviceName[64];
-  ULONG Option;
-  ULONG Status;
-
-} DOKAN_CONTROL, *PDOKAN_CONTROL;
+#ifdef _MSC_VER
 
 static VOID DokanDbgPrint(LPCSTR format, ...) {
   const char *outputString;
@@ -134,6 +120,8 @@ static VOID DokanDbgPrintW(LPCWSTR format, ...) {
   __pragma(warning(push)) __pragma(warning(disable : 4127)) while (0)          \
       __pragma(warning(pop))
 
+#endif // MSVC
+
 VOID DOKANAPI DokanUseStdErr(BOOL Status);
 
 VOID DOKANAPI DokanDebugMode(BOOL Status);
@@ -149,10 +137,8 @@ BOOL DOKANAPI DokanNetworkProviderUninstall();
 
 BOOL DOKANAPI DokanSetDebugMode(ULONG Mode);
 
-BOOL DOKANAPI DokanMountControl(PDOKAN_CONTROL Control);
-
 #ifdef __cplusplus
 }
 #endif
 
-#endif
+#endif // DOKANC_H_

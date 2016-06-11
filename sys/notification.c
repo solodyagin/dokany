@@ -1,9 +1,10 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2008 Hiroki Asakawa info@dokan-dev.net
+  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
-  http://dokan-dev.net/en
+  http://dokan-dev.github.io
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the Free
@@ -217,8 +218,11 @@ VOID NotificationLoop(__in PIRP_LIST PendingIrp, __in PIRP_LIST NotifyEvent) {
   InitializeListHead(&completeList);
 
   ASSERT(KeGetCurrentIrql() <= DISPATCH_LEVEL);
+  DDbgPrint("Try acquire SpinLock...\n");
   KeAcquireSpinLock(&PendingIrp->ListLock, &irpIrql);
+  DDbgPrint("SpinLock irp Acquired\n");
   KeAcquireSpinLock(&NotifyEvent->ListLock, &notifyIrql);
+  DDbgPrint("SpinLock notify Acquired\n");
 
   while (!IsListEmpty(&PendingIrp->ListHead) &&
          !IsListEmpty(&NotifyEvent->ListHead)) {
@@ -238,6 +242,7 @@ VOID NotificationLoop(__in PIRP_LIST PendingIrp, __in PIRP_LIST NotifyEvent) {
 
     if (irp == NULL) {
       // this IRP has already been canceled
+      DDbgPrint("Irp canceled\n");
       ASSERT(irpEntry->CancelRoutineFreeMemory == FALSE);
       DokanFreeIrpEntry(irpEntry);
       // push back
@@ -246,6 +251,7 @@ VOID NotificationLoop(__in PIRP_LIST PendingIrp, __in PIRP_LIST NotifyEvent) {
     }
 
     if (IoSetCancelRoutine(irp, NULL) == NULL) {
+      DDbgPrint("IoSetCancelRoutine return NULL\n");
       // Cancel routine will run as soon as we release the lock
       InitializeListHead(&irpEntry->ListEntry);
       irpEntry->CancelRoutineFreeMemory = TRUE;
@@ -281,11 +287,17 @@ VOID NotificationLoop(__in PIRP_LIST PendingIrp, __in PIRP_LIST NotifyEvent) {
     InsertTailList(&completeList, &irpEntry->ListEntry);
   }
 
+  DDbgPrint("Clear Events...\n");
   KeClearEvent(&NotifyEvent->NotEmpty);
+  DDbgPrint("Notify event cleared\n");
   KeClearEvent(&PendingIrp->NotEmpty);
+  DDbgPrint("Pending event cleared\n");
 
+  DDbgPrint("Release SpinLock...\n");
   KeReleaseSpinLock(&NotifyEvent->ListLock, notifyIrql);
+  DDbgPrint("SpinLock notify Released\n");
   KeReleaseSpinLock(&PendingIrp->ListLock, irpIrql);
+  DDbgPrint("SpinLock irp Released\n");
 
   while (!IsListEmpty(&completeList)) {
     listHead = RemoveHeadList(&completeList);
@@ -370,43 +382,22 @@ DokanStartEventNotificationThread(__in PDokanDCB Dcb) {
 }
 
 VOID DokanStopEventNotificationThread(__in PDokanDCB Dcb) {
-  PIO_WORKITEM workItem;
-
   DDbgPrint("==> DokanStopEventNotificationThread\n");
 
-  workItem = IoAllocateWorkItem(Dcb->DeviceObject);
-  if (workItem != NULL) {
-    IoQueueWorkItem(workItem, DokanStopEventNotificationThreadInternal,
-                    DelayedWorkQueue, workItem);
-  } else {
-    DDbgPrint("Can't create work item.");
-  }
-
-  DDbgPrint("<== DokanStopEventNotificationThread\n");
-}
-
-VOID DokanStopEventNotificationThreadInternal(__in PDEVICE_OBJECT DeviceObject,
-                                              __in PVOID Context) {
-  PDokanDCB Dcb;
-
-  UNREFERENCED_PARAMETER(Context);
-
-  DDbgPrint("==> DokanStopEventNotificationThreadInternal\n");
-
-  Dcb = DeviceObject->DeviceExtension;
   if (KeSetEvent(&Dcb->ReleaseEvent, 0, FALSE) > 0 &&
       Dcb->EventNotificationThread) {
+    DDbgPrint("Waiting for Notify thread to terminate.\n");
+    ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
     KeWaitForSingleObject(Dcb->EventNotificationThread, Executive, KernelMode,
                           FALSE, NULL);
+    DDbgPrint("Notify thread successfully terminated.\n");
     ObDereferenceObject(Dcb->EventNotificationThread);
     Dcb->EventNotificationThread = NULL;
   }
-
-  DDbgPrint("<== DokanStopEventNotificationThreadInternal\n");
+  DDbgPrint("<== DokanStopEventNotificationThread\n");
 }
 
-NTSTATUS
-DokanEventRelease(__in PDEVICE_OBJECT DeviceObject) {
+NTSTATUS DokanEventRelease(__in PDEVICE_OBJECT DeviceObject) {
   PDokanDCB dcb;
   PDokanVCB vcb;
   PDokanFCB fcb;
@@ -415,11 +406,19 @@ DokanEventRelease(__in PDEVICE_OBJECT DeviceObject) {
   PLIST_ENTRY ccbEntry, ccbNext, ccbHead;
   NTSTATUS status = STATUS_SUCCESS;
 
+  DDbgPrint("==> DokanEventRelease\n");
+
+  if (DeviceObject == NULL) {
+    return STATUS_INVALID_PARAMETER;
+  }
+
   vcb = DeviceObject->DeviceExtension;
   if (GetIdentifierType(vcb) != VCB) {
     return STATUS_INVALID_PARAMETER;
   }
   dcb = vcb->Dcb;
+
+  DokanDeleteMountPoint(dcb);
 
   // ExAcquireResourceExclusiveLite(&dcb->Resource, TRUE);
   dcb->Mounted = 0;
@@ -462,5 +461,57 @@ DokanEventRelease(__in PDEVICE_OBJECT DeviceObject) {
 
   DokanDeleteDeviceObject(dcb);
 
+  DDbgPrint("<== DokanEventRelease\n");
+
   return status;
+}
+
+NTSTATUS DokanGlobalEventRelease(__in PDEVICE_OBJECT DeviceObject,
+                                 __in PIRP Irp) {
+  PDOKAN_GLOBAL dokanGlobal;
+  PIO_STACK_LOCATION irpSp;
+  PDOKAN_UNICODE_STRING_INTERMEDIATE szMountPoint;
+  DOKAN_CONTROL dokanControl;
+  PMOUNT_ENTRY mountEntry;
+
+  dokanGlobal = DeviceObject->DeviceExtension;
+  if (GetIdentifierType(dokanGlobal) != DGL) {
+    return STATUS_INVALID_PARAMETER;
+  }
+
+  irpSp = IoGetCurrentIrpStackLocation(Irp);
+
+  if (irpSp->Parameters.DeviceIoControl.InputBufferLength <
+      sizeof(DOKAN_UNICODE_STRING_INTERMEDIATE)) {
+    DDbgPrint(
+        "Input buffer is too small (< DOKAN_UNICODE_STRING_INTERMEDIATE)\n");
+    return STATUS_BUFFER_TOO_SMALL;
+  }
+  szMountPoint =
+      (PDOKAN_UNICODE_STRING_INTERMEDIATE)Irp->AssociatedIrp.SystemBuffer;
+  if (irpSp->Parameters.DeviceIoControl.InputBufferLength <
+      sizeof(DOKAN_UNICODE_STRING_INTERMEDIATE) + szMountPoint->MaximumLength) {
+    DDbgPrint("Input buffer is too small\n");
+    return STATUS_BUFFER_TOO_SMALL;
+  }
+
+  RtlZeroMemory(&dokanControl, sizeof(dokanControl));
+  RtlStringCchCopyW(dokanControl.MountPoint, MAXIMUM_FILENAME_LENGTH,
+                    L"\\DosDevices\\");
+  if ((szMountPoint->Length / sizeof(WCHAR)) < 4) {
+    dokanControl.MountPoint[12] = towupper(szMountPoint->Buffer[0]);
+    dokanControl.MountPoint[13] = L':';
+    dokanControl.MountPoint[14] = L'\0';
+  } else {
+    RtlCopyMemory(&dokanControl.MountPoint[12], szMountPoint->Buffer,
+                  szMountPoint->Length);
+  }
+  mountEntry = FindMountEntry(dokanGlobal, &dokanControl);
+  if (mountEntry == NULL) {
+    DDbgPrint("Cannot found device associated to mount point %ws\n",
+              dokanControl.MountPoint);
+    return STATUS_BUFFER_TOO_SMALL;
+  }
+
+  return DokanEventRelease(mountEntry->MountControl.DeviceObject);
 }

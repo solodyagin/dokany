@@ -1,4 +1,7 @@
+#define WIN32_NO_STATUS
 #include <windows.h>
+#undef WIN32_NO_STATUS
+#include <ntstatus.h>
 #include <errno.h>
 #include <sys/utime.h>
 #include <sys/stat.h>
@@ -77,8 +80,8 @@ impl_fuse_context::impl_fuse_context(const struct fuse_operations *ops,
 {
   // Reset connection info
   memset(&conn_info_, 0, sizeof(fuse_conn_info));
-  conn_info_.max_write = ULONG_MAX;
-  conn_info_.max_readahead = ULONG_MAX;
+  conn_info_.max_write = UINT_MAX;
+  conn_info_.max_readahead = UINT_MAX;
   conn_info_.proto_major = FUSE_MAJOR_VERSION;
   conn_info_.proto_minor = FUSE_MINOR_VERSION;
 
@@ -104,7 +107,7 @@ int impl_fuse_context::do_open_dir(LPCWSTR FileName,
                                    PDOKAN_FILE_INFO DokanFileInfo) {
   if (ops_.opendir) {
     std::string fname = unixify(wchar_to_utf8_cstr(FileName));
-    std::auto_ptr<impl_file_handle> file;
+    std::unique_ptr<impl_file_handle> file;
     // TODO access_mode
     CHECKED(file_locks.get_file(
         fname, true, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -130,7 +133,7 @@ int impl_fuse_context::do_open_file(LPCWSTR FileName, DWORD share_mode,
   std::string fname = unixify(wchar_to_utf8_cstr(FileName));
   CHECKED(check_and_resolve(&fname));
 
-  std::auto_ptr<impl_file_handle> file;
+  std::unique_ptr<impl_file_handle> file;
   CHECKED(file_locks.get_file(fname, false, Flags, share_mode, file));
 
   fuse_file_info finfo = {0};
@@ -141,6 +144,41 @@ int impl_fuse_context::do_open_file(LPCWSTR FileName, DWORD share_mode,
   file->set_finfo(finfo);
   DokanFileInfo->Context = reinterpret_cast<ULONG64>(file.release());
   return 0;
+}
+
+int impl_fuse_context::do_delete_directory(LPCWSTR file_name,
+                                           PDOKAN_FILE_INFO dokan_file_info) {
+  std::string fname = unixify(wchar_to_utf8_cstr(file_name));
+
+  if (!ops_.rmdir || !ops_.getattr)
+    return -EINVAL;
+
+  // Make sure directory is NOT opened
+  // TODO: potential race here - Unix filesystems typically allow
+  // to delete open files and directories.
+  impl_file_handle *hndl =
+      reinterpret_cast<impl_file_handle *>(dokan_file_info->Context);
+  if (hndl)
+    return -EBUSY;
+
+  // A special case: symlinks are deleted by unlink, not rmdir
+  struct FUSE_STAT stbuf = {0};
+  CHECKED(ops_.getattr(fname.c_str(), &stbuf));
+  if (S_ISLNK(stbuf.st_mode) && ops_.unlink)
+    return ops_.unlink(fname.c_str());
+
+  // Ok, try to rmdir it.
+  return ops_.rmdir(fname.c_str());
+}
+
+int impl_fuse_context::do_delete_file(LPCWSTR file_name,
+                                      PDOKAN_FILE_INFO dokan_file_info) {
+  if (!ops_.unlink)
+    return -EINVAL;
+
+  // Note: we do not try to resolve symlink target
+  std::string fname = unixify(wchar_to_utf8_cstr(file_name));
+  return ops_.unlink(fname.c_str());
 }
 
 int impl_fuse_context::do_create_file(LPCWSTR FileName, DWORD Disposition,
@@ -156,6 +194,7 @@ int impl_fuse_context::do_create_file(LPCWSTR FileName, DWORD Disposition,
   // Create file?
   if (Disposition != FILE_CREATE && Disposition != FILE_SUPERSEDE &&
       Disposition != FILE_OPEN_IF && Disposition != FILE_OVERWRITE_IF) {
+    SetLastError(ERROR_FILE_NOT_FOUND);
     return -ENOENT; // No, we're trying to open an existing file!
   }
 
@@ -169,7 +208,7 @@ int impl_fuse_context::do_create_file(LPCWSTR FileName, DWORD Disposition,
     return do_open_file(FileName, share_mode, Flags, DokanFileInfo);
   }
 
-  std::auto_ptr<impl_file_handle> file;
+  std::unique_ptr<impl_file_handle> file;
   CHECKED(file_locks.get_file(fname, false, Flags, share_mode, file));
 
   fuse_file_info finfo = {0};
@@ -179,6 +218,7 @@ int impl_fuse_context::do_create_file(LPCWSTR FileName, DWORD Disposition,
 
   CHECKED(ops_.create(fname.c_str(), filemask_, &finfo));
 
+  file->set_finfo(finfo);
   DokanFileInfo->Context = reinterpret_cast<ULONG64>(file.release());
   return 0;
 }
@@ -242,16 +282,15 @@ int impl_fuse_context::walk_directory(void *buf, const char *name,
 
   struct FUSE_STAT stat = {0};
 
-  if (stbuf != NULL)
+  /* if (stbuf != NULL)
     stat = *stbuf;
-  else {
-    // No stat buffer - use 'getattr'.
-    // TODO: fill directory params here!!!
+  else { */
+    // stat (*stbuf) has only st_ino and st_mode -> request other info with getattr
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) // Special entries
-      stat.st_mode |= S_IFDIR;
+      stat.st_mode |= S_IFDIR; // TODO: fill directory params here!!!
     else
       CHECKED(wd->ctx->ops_.getattr((wd->dirname + name).c_str(), &stat));
-  }
+  //}
 
   if (S_ISLNK(stat.st_mode)) {
     std::string resolved;
@@ -357,6 +396,20 @@ int impl_fuse_context::cleanup(LPCWSTR file_name,
 
   // The one way to solve this is to keep a table of files 'still in flight'
   // and block until the file is closed. We're not doing this yet.
+
+  // No context for directories when ops_.opendir is not set
+  if (dokan_file_info->Context
+    || (dokan_file_info->IsDirectory && !ops_.opendir)) {
+    if (dokan_file_info->DeleteOnClose) {
+      close_file(file_name, dokan_file_info);
+      if (dokan_file_info->IsDirectory) {
+        do_delete_directory(file_name, dokan_file_info);
+      } else {
+        do_delete_file(file_name, dokan_file_info);
+      }
+    }
+  }
+
   return 0;
 }
 
@@ -374,25 +427,11 @@ int impl_fuse_context::delete_directory(LPCWSTR file_name,
                                         PDOKAN_FILE_INFO dokan_file_info) {
   std::string fname = unixify(wchar_to_utf8_cstr(file_name));
 
-  if (!ops_.rmdir || !ops_.getattr)
+  if (!ops_.getattr)
     return -EINVAL;
 
-  // Make sure directory is NOT opened
-  // TODO: potential race here - Unix filesystems typically allow
-  // to delete open files and directories.
-  impl_file_handle *hndl =
-      reinterpret_cast<impl_file_handle *>(dokan_file_info->Context);
-  if (hndl)
-    return -EBUSY;
-
-  // A special case: symlinks are deleted by unlink, not rmdir
   struct FUSE_STAT stbuf = {0};
-  CHECKED(ops_.getattr(fname.c_str(), &stbuf));
-  if (S_ISLNK(stbuf.st_mode) && ops_.unlink)
-    return ops_.unlink(fname.c_str());
-
-  // Ok, try to rmdir it.
-  return ops_.rmdir(fname.c_str());
+  return ops_.getattr(fname.c_str(), &stbuf);
 }
 
 win_error impl_fuse_context::create_file(LPCWSTR file_name, DWORD access_mode,
@@ -430,19 +469,26 @@ win_error impl_fuse_context::create_file(LPCWSTR file_name, DWORD access_mode,
       // Existing file
       // Check if we'll be able to truncate or delete the opened file
       // TODO: race condition here?
-      if (creation_disposition == CREATE_ALWAYS) {
+      if (creation_disposition == FILE_OVERWRITE) {
         if (!ops_.unlink)
           return -EINVAL;
         CHECKED(ops_.unlink(fname.c_str())); // Delete file
         // And create it!
         return do_create_file(file_name, creation_disposition, share_mode,
                               access_mode, dokan_file_info);
-      } else if (creation_disposition == TRUNCATE_EXISTING) {
+      } else if (creation_disposition == FILE_SUPERSEDE ||
+                 creation_disposition == FILE_OVERWRITE_IF) {
         if (!ops_.truncate)
           return -EINVAL;
         CHECKED(ops_.truncate(fname.c_str(), 0));
-      } else if (creation_disposition == CREATE_NEW) {
-        return win_error(ERROR_FILE_EXISTS, true);
+      } else if (creation_disposition == FILE_CREATE) {
+        SetLastError(ERROR_FILE_EXISTS);
+        return win_error(STATUS_OBJECT_NAME_COLLISION, true);
+      }
+
+      if (creation_disposition == FILE_OVERWRITE_IF ||
+          creation_disposition == FILE_OPEN_IF) {
+          SetLastError(ERROR_ALREADY_EXISTS);
       }
 
       return do_open_file(file_name, share_mode, access_mode, dokan_file_info);
@@ -608,12 +654,13 @@ int impl_fuse_context::get_file_information(
 
 int impl_fuse_context::delete_file(LPCWSTR file_name,
                                    PDOKAN_FILE_INFO dokan_file_info) {
-  if (!ops_.unlink)
+  std::string fname = unixify(wchar_to_utf8_cstr(file_name));
+
+  if (!ops_.getattr)
     return -EINVAL;
 
-  // Note: we do not try to resolve symlink target
-  std::string fname = unixify(wchar_to_utf8_cstr(file_name));
-  return ops_.unlink(fname.c_str());
+  struct FUSE_STAT stbuf = {0};
+  return ops_.getattr(fname.c_str(), &stbuf);
 }
 
 int impl_fuse_context::move_file(LPCWSTR file_name, LPCWSTR new_file_name,
@@ -827,8 +874,7 @@ int impl_fuse_context::get_disk_free_space(PULONGLONG free_bytes_available,
   }
 
   struct statvfs vfs = {0};
-  // Why do we need path argument??
-  CHECKED(ops_.statfs("", &vfs));
+  CHECKED(ops_.statfs("/", &vfs));
 
   if (free_bytes_available != NULL)
     *free_bytes_available = uint64_t(vfs.f_bsize) * vfs.f_bavail;
@@ -865,8 +911,6 @@ int impl_fuse_context::get_volume_information(LPWSTR volume_name_buffer,
 }
 
 int impl_fuse_context::mounted(PDOKAN_FILE_INFO DokanFileInfo) {
-	if (ops_.destroy)
-		ops_.destroy(user_data_); // Ignoring result
 	return 0;
 }
 
@@ -883,24 +927,18 @@ int impl_fuse_context::unmounted(PDOKAN_FILE_INFO DokanFileInfo) {
 // get required shared mode given an access mode
 static DWORD required_share(DWORD access_mode) {
   DWORD share = 0;
-  if (access_mode & (STANDARD_RIGHTS_EXECUTE | STANDARD_RIGHTS_READ |
-                     GENERIC_READ | GENERIC_EXECUTE | FILE_GENERIC_EXECUTE |
-                     FILE_GENERIC_READ | READ_CONTROL | FILE_EXECUTE |
-                     FILE_LIST_DIRECTORY | FILE_READ_DATA | FILE_READ_EA))
+  if (access_mode & (FILE_EXECUTE | FILE_READ_DATA))
     share |= FILE_SHARE_READ;
-  if (access_mode &
-      (STANDARD_RIGHTS_WRITE | GENERIC_WRITE | FILE_GENERIC_WRITE | WRITE_DAC |
-       WRITE_OWNER | FILE_WRITE_ATTRIBUTES | FILE_WRITE_DATA | FILE_WRITE_EA |
-       FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_APPEND_DATA))
+  if (access_mode & (FILE_WRITE_DATA | FILE_APPEND_DATA))
     share |= FILE_SHARE_WRITE;
-  if (access_mode & (DELETE | FILE_DELETE_CHILD))
+  if (access_mode & DELETE)
     share |= FILE_SHARE_DELETE;
   return share;
 }
 
 int impl_file_locks::get_file(const std::string &name, bool is_dir,
                               DWORD access_mode, DWORD shared_mode,
-                              std::auto_ptr<impl_file_handle> &file) {
+                              std::unique_ptr<impl_file_handle> &file) {
   int res = 0;
   file.reset(new impl_file_handle(is_dir, shared_mode));
 

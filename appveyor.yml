@@ -4,28 +4,75 @@
       secure: 1mtSEr5uFQI5rdwItPXrR1y4fV+SUWt55lUSQB5o3x8=
     CoverityNotificationEmail:
       secure: 0SPcT7MZEWl9NsqpKSOoLBCfqx/KVDAte5+xvbRremg=
-  version: 0.8.0-{build}
-  configuration:
-  - Release
-  - Win7 Release
-  - Win8 Release
-  - Win8.1 Release
-  - Win10 Release
-  - Coverity
-  platform:
-  - Win32
-  - x64
+    global:
+      CYG_CACHE: C:\cygwin\var\cache\setup
+      CYG64_CACHE: C:\cygwin64\var\cache\setup
 
   os: Visual Studio 2015
+  version: 1.0.0-{build}
+  configuration:
+  - All
+  - Coverity
+  - FsTest
+  platform:
+  - x64
+  
+  cache:
+  - '%CYG_CACHE%'
+  - '%CYG64_CACHE%'
+
+  install:
+    - ps: |
+        if ($env:CONFIGURATION -eq "All") {
+          Start-FileDownload "https://cygwin.com/setup-x86.exe" -FileName "setup-x86.exe"
+          Start-FileDownload "https://cygwin.com/setup-x86_64.exe" -FileName "setup-x86_64.exe"
+          
+          function updateCygwin($cygwinexe, $installFolder, $cacheFolder) {
+            Write-Host "Update Cygwin: " $cygwinexe -NoNewline
+            cmd /c start /wait $cygwinexe -qnNdO -R $installFolder -s http://cygwin.mirror.constant.com -l $cacheFolder -P mingw64-i686-gcc-g++ -P mingw64-x86_64-gcc-g++ -P gcc-g++ -P make -P cmake
+            Write-Host " - OK" -ForegroundColor Green
+          }
+          
+          updateCygwin "setup-x86.exe" C:/cygwin $env:CYG_CACHE
+          updateCygwin "setup-x86_64.exe" C:/cygwin64 $env:CYG64_CACHE
+        }
+        
+    - ps: |
+        if ($env:CONFIGURATION -eq "All") {
+          function bash($command) {
+            Write-Host $command -NoNewline
+            cmd /c start /wait C:\msys64\usr\bin\bash.exe --login -c $command
+            Write-Host " - OK" -ForegroundColor Green
+          }
+          
+          # install latest pacman
+          bash "pacman -Sy --noconfirm pacman pacman-mirrors"
+          # update core packages
+          bash "pacman -Syu --noconfirm"
+          
+          bash "pacman --sync --noconfirm mingw-w64-{x86_64,i686}-toolchain mingw-w64-{x86_64,i686}-cmake"
+        }
+        
+    - ps: |
+        if ($env:CONFIGURATION -eq "FsTest") {
+          & Bcdedit.exe -set TESTSIGNING ON;
+          echo "Before reboot";
+          Restart-Computer -Force;
+          Start-Sleep -s 10;
+        }
+
+  before_build:
+  # Remove VS build warning http://help.appveyor.com/discussions/problems/4569-the-target-_convertpdbfiles-listed-in-a-beforetargets-attribute-at-c-does-not-exist-in-the-project-and-will-be-ignored
+  - del "C:\Program Files (x86)\MSBuild\14.0\Microsoft.Common.targets\ImportAfter\Xamarin.Common.targets"
 
   build_script:
   - ps: |
-
+      Write-Host Start building...
       $buildCmd = "C:\Program Files (x86)\MSBuild\14.0\Bin\MSBuild.exe"
 
       if ($env:CONFIGURATION -eq "Coverity") {
         
-        if (!($env:PLATFORM -eq "Win32") -or "$env:APPVEYOR_PULL_REQUEST_TITLE") {
+        if ("$env:APPVEYOR_PULL_REQUEST_TITLE" -or !($env:APPVEYOR_REPO_BRANCH -eq 'master')) {
           return;
         }
         
@@ -57,13 +104,76 @@
         -z "coverity.zip" `
         -d "Appveyor build." `
         --codeVersion "$env:APPVEYOR_BUILD_VERSION"
+      
+      } elseif ($env:CONFIGURATION -eq "All") {
+
+        $env:Path = $env:Path + ";C:\Program Files (x86)\WiX Toolset v3.10;C:\Program Files (x86)\Windows Kits\8.1\bin\x64\"
         
-      } else {
+        & .\build.bat
+        
+        Write-Host Install cert and sign...
+        .\cert\dokan-import.ps1
+        .\cert\dokan-sign.ps1
+        $env:CERTISSUER="DokanCA"
+        $env:ADDITIONALCERT="$pwd\cert\DokanCA.cer"
+        $env:SIGNTOOL="C:\Program Files (x86)\Windows Kits\8.1\bin\x64\signtool.exe"
+        Write-Host Binaries signed !	
+        
+        cd dokan_wix
+        (gc version.xml) -replace 'no', 'yes' | sc version.xml
+        
+        $Platform = "Mixed Platforms"
+        $buildArgs = @(
+        "Dokan_WiX.sln",
+        "/m",
+        "/l:C:\Program Files\AppVeyor\BuildAgent\Appveyor.MSBuildLogger.dll",
+        "/p:Configuration=Release",
+        "/p:Platform=${Platform}")
+        
+        & $buildCmd $buildArgs
+        
+        if($LASTEXITCODE -ne 0) {
+          throw "Build failed"
+        }
+        
+        Write-Host Upload Artifcat...
+        Push-AppveyorArtifact C:\projects\dokany\dokan_wix\Bootstrapper\bin\Release\DokanSetup.exe -FileName "DokanSetup.exe"
+        Write-Host Artifcat uploaded!
+        
+      } elseif ($env:CONFIGURATION -eq "FsTest") {
+        
         $buildArgs = @(
         "/m",
         "/l:C:\Program Files\AppVeyor\BuildAgent\Appveyor.MSBuildLogger.dll",
-        "/p:Configuration=$env:CONFIGURATION",
+        "/p:Configuration=Win10 Debug",
         "/p:Platform=$env:PLATFORM")
         
         & $buildCmd $buildArgs
+
+        $certMgr = "C:\Program Files (x86)\Windows Kits\10\bin\x64\certmgr.exe"
+        & $certMgr /add x64\Win10Debug\dokan1.cer /s /r localMachine root
+        & $certMgr /add x64\Win10Debug\dokan1.cer /s /r localMachine trustedpublisher
+        
+        cp .\x64\Win10Debug\dokan1.sys C:\Windows\System32\drivers\
+        & .\x64\Debug\dokanctl.exe /i d
+        & .\x64\Debug\dokanctl.exe /i n
+        $app = Start-Process -passthru .\x64\Debug\mirror.exe -ArgumentList "/r C:\TMP /l m"
+        Start-Sleep -s 5
+        
+        git clone https://github.com/Liryna/winfstest.git
+        $buildArgs = @(
+        ".\winfstest\winfstest.sln",
+        "/m",
+        "/l:C:\Program Files\AppVeyor\BuildAgent\Appveyor.MSBuildLogger.dll",
+        "/p:Configuration=Debug",
+        "/p:Platform=$env:PLATFORM")
+        
+        New-Item C:\TMP -type directory
+        & $buildCmd $buildArgs
+        & .\winfstest\TestSuite\run-winfstest.bat . M:\
+
+        Start-Sleep -s 5
+        Stop-Process $app.Id
       }
+      Write-Host Build Finished !
+

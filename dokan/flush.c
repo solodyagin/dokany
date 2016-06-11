@@ -1,9 +1,10 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2008 Hiroki Asakawa info@dokan-dev.net
+  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
-  http://dokan-dev.net/en
+  http://dokan-dev.github.io
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the Free
@@ -28,6 +29,7 @@ VOID DispatchFlush(HANDLE Handle, PEVENT_CONTEXT EventContext,
   PEVENT_INFORMATION eventInfo;
   ULONG sizeOfEventInfo = sizeof(EVENT_INFORMATION);
   PDOKAN_OPEN_INFO openInfo;
+  NTSTATUS status;
 
   CheckFileName(EventContext->Operation.Flush.FileName);
 
@@ -36,13 +38,18 @@ VOID DispatchFlush(HANDLE Handle, PEVENT_CONTEXT EventContext,
 
   DbgPrint("###Flush %04d\n", openInfo != NULL ? openInfo->EventId : -1);
 
-  eventInfo->Status = STATUS_SUCCESS;
-
   if (DokanInstance->DokanOperations->FlushFileBuffers) {
 
-    NTSTATUS status = DokanInstance->DokanOperations->FlushFileBuffers(
+    status = DokanInstance->DokanOperations->FlushFileBuffers(
         EventContext->Operation.Flush.FileName, &fileInfo);
 
+  } else {
+    status = STATUS_NOT_IMPLEMENTED;
+  }
+
+  if (status == STATUS_NOT_IMPLEMENTED) {
+    eventInfo->Status = STATUS_SUCCESS;
+  } else {
     eventInfo->Status =
         status != STATUS_SUCCESS ? STATUS_NOT_SUPPORTED : STATUS_SUCCESS;
   }

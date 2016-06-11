@@ -1,9 +1,10 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2008 Hiroki Asakawa info@dokan-dev.net
+  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
-  http://dokan-dev.net/en
+  http://dokan-dev.github.io
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the Free
@@ -50,8 +51,10 @@ VOID DispatchLock(HANDLE Handle, PEVENT_CONTEXT EventContext,
           // EventContext->Operation.Lock.Key,
           &fileInfo);
 
-      eventInfo->Status =
-          status != STATUS_SUCCESS ? STATUS_LOCK_NOT_GRANTED : STATUS_SUCCESS;
+      if (status != STATUS_NOT_IMPLEMENTED) {
+        eventInfo->Status =
+            status != STATUS_SUCCESS ? STATUS_LOCK_NOT_GRANTED : STATUS_SUCCESS;
+      }
     }
     break;
   case IRP_MN_UNLOCK_ALL:
@@ -68,7 +71,10 @@ VOID DispatchLock(HANDLE Handle, PEVENT_CONTEXT EventContext,
           // EventContext->Operation.Lock.Key,
           &fileInfo);
 
-      eventInfo->Status = STATUS_SUCCESS; // always succeeds so it cannot fail ?
+      if (status != STATUS_NOT_IMPLEMENTED) {
+        eventInfo->Status =
+            STATUS_SUCCESS; // always succeeds so it cannot fail ?
+      }
     }
     break;
   default:

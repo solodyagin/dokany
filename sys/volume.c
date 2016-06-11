@@ -1,9 +1,10 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2008 Hiroki Asakawa info@dokan-dev.net
+  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
-  http://dokan-dev.net/en
+  http://dokan-dev.github.io
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the Free
@@ -31,6 +32,7 @@ DokanDispatchQueryVolumeInformation(__in PDEVICE_OBJECT DeviceObject,
   PDokanDCB dcb;
   PDokanCCB ccb;
   ULONG info = 0;
+  ULONG RequiredLength;
 
   __try {
 
@@ -41,7 +43,13 @@ DokanDispatchQueryVolumeInformation(__in PDEVICE_OBJECT DeviceObject,
     if (GetIdentifierType(vcb) != VCB) {
       return STATUS_INVALID_PARAMETER;
     }
+
     dcb = vcb->Dcb;
+
+    if (!dcb->Mounted) {
+      status = STATUS_VOLUME_DISMOUNTED;
+      __leave;
+    }
 
     irpSp = IoGetCurrentIrpStackLocation(Irp);
     buffer = Irp->AssociatedIrp.SystemBuffer;
@@ -63,6 +71,41 @@ DokanDispatchQueryVolumeInformation(__in PDEVICE_OBJECT DeviceObject,
     switch (irpSp->Parameters.QueryVolume.FsInformationClass) {
     case FileFsVolumeInformation:
       DDbgPrint("  FileFsVolumeInformation\n");
+      if (vcb->HasEventWait) {
+        break;
+      }
+
+      DDbgPrint("  Still no threads for processing available\n");
+      PFILE_FS_VOLUME_INFORMATION FsVolInfo;
+
+      if (irpSp->Parameters.QueryVolume.Length <
+          sizeof(FILE_FS_VOLUME_INFORMATION)) {
+        status = STATUS_BUFFER_OVERFLOW;
+        __leave;
+      }
+
+      FsVolInfo = (PFILE_FS_VOLUME_INFORMATION)buffer;
+      FsVolInfo->VolumeCreationTime.QuadPart = 0;
+      FsVolInfo->VolumeSerialNumber = 0x19831116;
+
+      FsVolInfo->VolumeLabelLength = (USHORT)wcslen(VOLUME_LABEL) * sizeof(WCHAR);
+      /* We don't support ObjectId */
+      FsVolInfo->SupportsObjects = FALSE;
+
+      RequiredLength = sizeof(FILE_FS_VOLUME_INFORMATION) + FsVolInfo->VolumeLabelLength -
+                       sizeof(WCHAR);
+
+      if (irpSp->Parameters.QueryVolume.Length < RequiredLength) {
+        Irp->IoStatus.Information = sizeof(FILE_FS_VOLUME_INFORMATION);
+        status = STATUS_BUFFER_OVERFLOW;
+        __leave;
+      }
+
+      RtlCopyMemory(FsVolInfo->VolumeLabel, VOLUME_LABEL, FsVolInfo->VolumeLabelLength);
+
+      Irp->IoStatus.Information = RequiredLength;
+      status = STATUS_SUCCESS;
+      __leave;
       break;
 
     case FileFsLabelInformation:
@@ -92,6 +135,41 @@ DokanDispatchQueryVolumeInformation(__in PDEVICE_OBJECT DeviceObject,
 
     case FileFsAttributeInformation:
       DDbgPrint("  FileFsAttributeInformation\n");
+      if (vcb->HasEventWait) {
+        break;
+      }
+
+      DDbgPrint("  Still no threads for processing available\n");
+      PFILE_FS_ATTRIBUTE_INFORMATION FsAttrInfo;
+
+      if (irpSp->Parameters.QueryVolume.Length <
+          sizeof(FILE_FS_ATTRIBUTE_INFORMATION)) {
+        status = STATUS_BUFFER_OVERFLOW;
+        __leave;
+      }
+
+      FsAttrInfo =
+          (PFILE_FS_ATTRIBUTE_INFORMATION)Irp->AssociatedIrp.SystemBuffer;
+      FsAttrInfo->FileSystemAttributes = FILE_SUPPORTS_HARD_LINKS |
+                                         FILE_CASE_SENSITIVE_SEARCH |
+                                         FILE_CASE_PRESERVED_NAMES;
+
+      FsAttrInfo->MaximumComponentNameLength = 256;
+      FsAttrInfo->FileSystemNameLength = 8;
+
+      RequiredLength =
+          sizeof(FILE_FS_ATTRIBUTE_INFORMATION) + FsAttrInfo->FileSystemNameLength - sizeof(WCHAR);
+
+      if (irpSp->Parameters.QueryVolume.Length < RequiredLength) {
+        Irp->IoStatus.Information = sizeof(FILE_FS_ATTRIBUTE_INFORMATION);
+        status = STATUS_BUFFER_OVERFLOW;
+        __leave;
+      }
+
+      RtlCopyMemory(FsAttrInfo->FileSystemName, L"NTFS", FsAttrInfo->FileSystemNameLength);
+      Irp->IoStatus.Information = RequiredLength;
+      status = STATUS_SUCCESS;
+      __leave;
       break;
 
     case FileFsControlInformation:
@@ -165,7 +243,8 @@ DokanDispatchQueryVolumeInformation(__in PDEVICE_OBJECT DeviceObject,
 }
 
 VOID DokanCompleteQueryVolumeInformation(__in PIRP_ENTRY IrpEntry,
-                                         __in PEVENT_INFORMATION EventInfo) {
+                                         __in PEVENT_INFORMATION EventInfo,
+                                         __in PDEVICE_OBJECT DeviceObject) {
   PIRP irp;
   PIO_STACK_LOCATION irpSp;
   NTSTATUS status = STATUS_SUCCESS;
@@ -173,6 +252,8 @@ VOID DokanCompleteQueryVolumeInformation(__in PIRP_ENTRY IrpEntry,
   ULONG bufferLen = 0;
   PVOID buffer = NULL;
   PDokanCCB ccb;
+  PDokanDCB dcb;
+  PDokanVCB vcb;
 
   DDbgPrint("==> DokanCompleteQueryVolumeInformation\n");
 
@@ -180,6 +261,8 @@ VOID DokanCompleteQueryVolumeInformation(__in PIRP_ENTRY IrpEntry,
   irpSp = IrpEntry->IrpSp;
 
   ccb = IrpEntry->FileObject->FsContext2;
+  vcb = DeviceObject->DeviceExtension;
+  dcb = vcb->Dcb;
 
   // ASSERT(ccb != NULL);
 
@@ -214,6 +297,28 @@ VOID DokanCompleteQueryVolumeInformation(__in PIRP_ENTRY IrpEntry,
     // copy the information from user-mode to specified buffer
     ASSERT(buffer != NULL);
 
+    if (irpSp->Parameters.QueryVolume.FsInformationClass ==
+            FileFsVolumeInformation &&
+        dcb->VolumeLabel != NULL) {
+
+      PFILE_FS_VOLUME_INFORMATION volumeInfo =
+          (PFILE_FS_VOLUME_INFORMATION)EventInfo->Buffer;
+
+      ULONG remainingLength = bufferLen;
+      remainingLength -=
+          FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION, VolumeLabel[0]);
+      ULONG bytesToCopy = (ULONG)wcslen(dcb->VolumeLabel) * sizeof(WCHAR);
+      if (remainingLength < bytesToCopy) {
+        bytesToCopy = remainingLength;
+      }
+
+      volumeInfo->VolumeLabelLength = bytesToCopy;
+      RtlCopyMemory(volumeInfo->VolumeLabel, dcb->VolumeLabel, bytesToCopy);
+      remainingLength -= bytesToCopy;
+
+      EventInfo->BufferLength = bufferLen - remainingLength;
+    }
+
     RtlZeroMemory(buffer, bufferLen);
     RtlCopyMemory(buffer, EventInfo->Buffer, EventInfo->BufferLength);
 
@@ -232,14 +337,64 @@ NTSTATUS
 DokanDispatchSetVolumeInformation(__in PDEVICE_OBJECT DeviceObject,
                                   __in PIRP Irp) {
   NTSTATUS status = STATUS_INVALID_PARAMETER;
+  PDokanVCB vcb;
+  PDokanDCB dcb;
+  PIO_STACK_LOCATION irpSp;
+  PVOID buffer;
+  FS_INFORMATION_CLASS FsInformationClass;
 
-  UNREFERENCED_PARAMETER(DeviceObject);
+  __try
 
-  DDbgPrint("==> DokanSetVolumeInformation\n");
+  {
+    DDbgPrint("==> DokanSetVolumeInformation\n");
 
-  DokanCompleteIrpRequest(Irp, status, 0);
+    vcb = DeviceObject->DeviceExtension;
+    if (GetIdentifierType(vcb) != VCB) {
+      return STATUS_INVALID_PARAMETER;
+    }
 
-  DDbgPrint("<== DokanSetVolumeInformation");
+    dcb = vcb->Dcb;
+
+    if (!dcb->Mounted) {
+      status = STATUS_VOLUME_DISMOUNTED;
+      __leave;
+    }
+
+    irpSp = IoGetCurrentIrpStackLocation(Irp);
+    buffer = Irp->AssociatedIrp.SystemBuffer;
+    FsInformationClass = irpSp->Parameters.SetVolume.FsInformationClass;
+
+    switch (FsInformationClass) {
+    case FileFsLabelInformation:
+
+      DDbgPrint("  FileFsLabelInformation\n");
+
+      if (sizeof(FILE_FS_LABEL_INFORMATION) >
+          irpSp->Parameters.SetVolume.Length)
+        return STATUS_INVALID_PARAMETER;
+
+      PFILE_FS_LABEL_INFORMATION Info = (PFILE_FS_LABEL_INFORMATION)buffer;
+      ExAcquireResourceExclusiveLite(&dcb->Resource, TRUE);
+      if (dcb->VolumeLabel != NULL)
+        ExFreePool(dcb->VolumeLabel);
+      dcb->VolumeLabel =
+          ExAllocatePool(Info->VolumeLabelLength + sizeof(WCHAR));
+      RtlCopyMemory(dcb->VolumeLabel, Info->VolumeLabel,
+                    Info->VolumeLabelLength);
+      dcb->VolumeLabel[Info->VolumeLabelLength / sizeof(WCHAR)] = '\0';
+      ExReleaseResourceLite(&dcb->Resource);
+      DDbgPrint(" volume label changed to %ws\n", dcb->VolumeLabel);
+
+      status = STATUS_SUCCESS;
+      break;
+    }
+
+  } __finally {
+
+    DokanCompleteIrpRequest(Irp, status, 0);
+  }
+
+  DDbgPrint("<== DokanSetVolumeInformation\n");
 
   return status;
 }

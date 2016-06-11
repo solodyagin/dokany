@@ -1,9 +1,10 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2008 Hiroki Asakawa info@dokan-dev.net
+  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
-  http://dokan-dev.net/en
+  http://dokan-dev.github.io
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the Free
@@ -18,8 +19,8 @@ You should have received a copy of the GNU Lesser General Public License along
 with this program. If not, see <http://www.gnu.org/licenses/>.
 */
 
-#ifndef _DOKANI_H_
-#define _DOKANI_H_
+#ifndef DOKANI_H_
+#define DOKANI_H_
 
 #define WIN32_NO_STATUS
 #include <windows.h>
@@ -43,6 +44,7 @@ typedef struct _DOKAN_INSTANCE {
   // (when there are many mounts, each mount uses different DeviceName)
   WCHAR DeviceName[64];
   WCHAR MountPoint[MAX_PATH];
+  WCHAR UNCName[64];
 
   ULONG DeviceNumber;
   ULONG MountId;
@@ -74,11 +76,14 @@ LPWSTR
 GetRawDeviceName(LPCWSTR DeviceName, LPWSTR DestinationBuffer,
                  rsize_t DestinationBufferSizeInElements);
 
-void ALIGN_ALLOCATION_SIZE(PLARGE_INTEGER size);
+void ALIGN_ALLOCATION_SIZE(PLARGE_INTEGER size, PDOKAN_OPTIONS DokanOptions);
 
 UINT __stdcall DokanLoop(PVOID Param);
 
-BOOL DokanMount(LPCWSTR MountPoint, LPCWSTR DeviceName);
+BOOL DokanMount(LPCWSTR MountPoint, LPCWSTR DeviceName,
+                PDOKAN_OPTIONS DokanOptions);
+
+BOOL IsMountPointDriveLetter(LPCWSTR mountPoint);
 
 VOID SendEventInformation(HANDLE Handle, PEVENT_INFORMATION EventInfo,
                           ULONG EventLength, PDOKAN_INSTANCE DokanInstance);
@@ -144,6 +149,8 @@ ManageDriver(LPCWSTR DriverName, LPCWSTR ServiceName, USHORT Function);
 
 BOOL SendReleaseIRP(LPCWSTR DeviceName);
 
+BOOL SendGlobalReleaseIRP(LPCWSTR MountPoint);
+
 VOID CheckFileName(LPWSTR FileName);
 
 VOID ClearFindData(PLIST_ENTRY ListHead);
@@ -162,4 +169,4 @@ VOID ReleaseDokanOpenInfo(PEVENT_INFORMATION EventInfomation,
 }
 #endif
 
-#endif
+#endif // DOKANI_H_

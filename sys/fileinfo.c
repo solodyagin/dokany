@@ -1,9 +1,10 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2008 Hiroki Asakawa info@dokan-dev.net
+  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
-  http://dokan-dev.net/en
+  http://dokan-dev.github.io
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the Free
@@ -97,6 +98,10 @@ DokanDispatchQueryInformation(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
     case FileCompressionInformation:
       DDbgPrint("  FileCompressionInformation\n");
       break;
+    case FileNormalizedNameInformation: // Fake implementation by returning
+                                        // FileNameInformation result.
+                                        // TODO: implement it
+      DDbgPrint("  FileNormalizedNameInformation\n");
     case FileNameInformation: {
       PFILE_NAME_INFORMATION nameInfo;
 
@@ -155,6 +160,15 @@ DokanDispatchQueryInformation(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
     case FileStreamInformation:
       DDbgPrint("  FileStreamInformation\n");
       break;
+	case FileStandardLinkInformation:
+	  DDbgPrint("  FileStandardLinkInformation\n");
+	  break;
+    case FileNetworkPhysicalNameInformation:
+      DDbgPrint("  FileNetworkPhysicalNameInformation\n");
+      break;
+	case FileRemoteProtocolInformation:
+	  DDbgPrint("  FileRemoteProtocolInformation\n");
+	  break;
     default:
       DDbgPrint("  unknown type:%d\n",
                 irpSp->Parameters.QueryFile.FileInformationClass);

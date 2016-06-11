@@ -1,9 +1,10 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2008 Hiroki Asakawa info@dokan-dev.net
+  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
-  http://dokan-dev.net/en
+  http://dokan-dev.github.io
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the Free
@@ -26,6 +27,8 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 #endif
 
 ULONG g_Debug = DOKAN_DEBUG_DEFAULT;
+LOOKASIDE_LIST_EX g_DokanCCBLookasideList;
+LOOKASIDE_LIST_EX g_DokanFCBLookasideList;
 
 #if _WIN32_WINNT < 0x0501
 PFN_FSRTLTEARDOWNPERSTREAMCONTEXTS DokanFsRtlTeardownPerStreamContexts;
@@ -128,6 +131,19 @@ DokanFilterCallbackAcquireForCreateSection(__in PFS_FILTER_CALLBACK_DATA
   }
 }
 
+BOOLEAN
+DokanLookasideCreate(LOOKASIDE_LIST_EX *pCache, size_t cbElement) {
+  NTSTATUS Status = ExInitializeLookasideListEx(
+      pCache, NULL, NULL, NonPagedPool, 0, cbElement, TAG, 0);
+
+  if (!NT_SUCCESS(Status)) {
+    DDbgPrint("ExInitializeLookasideListEx failed, Status (0x%x)", Status);
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
 NTSTATUS
 DriverEntry(__in PDRIVER_OBJECT DriverObject, __in PUNICODE_STRING RegistryPath)
 
@@ -199,6 +215,8 @@ Return Value:
 
   fastIoDispatch = ExAllocatePool(sizeof(FAST_IO_DISPATCH));
   if (!fastIoDispatch) {
+    IoDeleteDevice(dokanGlobal->FsDiskDeviceObject);
+    IoDeleteDevice(dokanGlobal->FsCdDeviceObject);
     IoDeleteDevice(dokanGlobal->DeviceObject);
     DDbgPrint("  ExAllocatePool failed");
     return STATUS_INSUFFICIENT_RESOURCES;
@@ -240,10 +258,27 @@ Return Value:
       FsRtlRegisterFileSystemFilterCallbacks(DriverObject, &filterCallbacks);
 
   if (!NT_SUCCESS(status)) {
+    IoDeleteDevice(dokanGlobal->FsDiskDeviceObject);
+    IoDeleteDevice(dokanGlobal->FsCdDeviceObject);
     IoDeleteDevice(dokanGlobal->DeviceObject);
     DDbgPrint("  FsRtlRegisterFileSystemFilterCallbacks returned 0x%x\n",
               status);
     return status;
+  }
+
+  if (!DokanLookasideCreate(&g_DokanCCBLookasideList, sizeof(DokanCCB))) {
+    IoDeleteDevice(dokanGlobal->FsDiskDeviceObject);
+    IoDeleteDevice(dokanGlobal->FsCdDeviceObject);
+    IoDeleteDevice(dokanGlobal->DeviceObject);
+    return STATUS_INSUFFICIENT_RESOURCES;
+  }
+
+  if (!DokanLookasideCreate(&g_DokanFCBLookasideList, sizeof(DokanFCB))) {
+    IoDeleteDevice(dokanGlobal->FsDiskDeviceObject);
+    IoDeleteDevice(dokanGlobal->FsCdDeviceObject);
+    IoDeleteDevice(dokanGlobal->DeviceObject);
+    ExDeleteLookasideListEx(&g_DokanCCBLookasideList);
+    return STATUS_INSUFFICIENT_RESOURCES;
   }
 
   DDbgPrint("<== DriverEntry\n");
@@ -273,18 +308,30 @@ Return Value:
   PDEVICE_OBJECT deviceObject = DriverObject->DeviceObject;
   WCHAR symbolicLinkBuf[] = DOKAN_GLOBAL_SYMBOLIC_LINK_NAME;
   UNICODE_STRING symbolicLinkName;
+  PDOKAN_GLOBAL dokanGlobal;
 
   // PAGED_CODE();
   DDbgPrint("==> DokanUnload\n");
 
-  if (GetIdentifierType(deviceObject->DeviceExtension) == DGL) {
+  dokanGlobal = deviceObject->DeviceExtension;
+  if (GetIdentifierType(dokanGlobal) == DGL) {
     DDbgPrint("  Delete Global DeviceObject\n");
+
     RtlInitUnicodeString(&symbolicLinkName, symbolicLinkBuf);
     IoDeleteSymbolicLink(&symbolicLinkName);
+
+    IoUnregisterFileSystem(dokanGlobal->FsDiskDeviceObject);
+    IoUnregisterFileSystem(dokanGlobal->FsCdDeviceObject);
+
+    IoDeleteDevice(dokanGlobal->FsDiskDeviceObject);
+    IoDeleteDevice(dokanGlobal->FsCdDeviceObject);
     IoDeleteDevice(deviceObject);
   }
 
   ExDeleteNPagedLookasideList(&DokanIrpEntryLookasideList);
+
+  ExDeleteLookasideListEx(&g_DokanCCBLookasideList);
+  ExDeleteLookasideListEx(&g_DokanFCBLookasideList);
 
   DDbgPrint("<== DokanUnload\n");
   return;
@@ -301,52 +348,6 @@ DokanDispatchShutdown(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
 
   DDbgPrint("<== DokanShutdown\n");
   return STATUS_SUCCESS;
-}
-
-NTSTATUS
-DokanDispatchPnp(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
-  PIO_STACK_LOCATION irpSp;
-  NTSTATUS status = STATUS_SUCCESS;
-
-  UNREFERENCED_PARAMETER(DeviceObject);
-
-  // PAGED_CODE();
-
-  __try {
-    DDbgPrint("==> DokanPnp\n");
-
-    irpSp = IoGetCurrentIrpStackLocation(Irp);
-
-    switch (irpSp->MinorFunction) {
-    case IRP_MN_QUERY_REMOVE_DEVICE:
-      DDbgPrint("  IRP_MN_QUERY_REMOVE_DEVICE\n");
-      break;
-    case IRP_MN_SURPRISE_REMOVAL:
-      DDbgPrint("  IRP_MN_SURPRISE_REMOVAL\n");
-      break;
-    case IRP_MN_REMOVE_DEVICE:
-      DDbgPrint("  IRP_MN_REMOVE_DEVICE\n");
-      break;
-    case IRP_MN_CANCEL_REMOVE_DEVICE:
-      DDbgPrint("  IRP_MN_CANCEL_REMOVE_DEVICE\n");
-      break;
-    case IRP_MN_QUERY_DEVICE_RELATIONS:
-      DDbgPrint("  IRP_MN_QUERY_DEVICE_RELATIONS\n");
-      status = STATUS_INVALID_PARAMETER;
-      break;
-    default:
-      DDbgPrint("   other minnor function %d\n", irpSp->MinorFunction);
-      break;
-      // IoSkipCurrentIrpStackLocation(Irp);
-      // status = IoCallDriver(Vcb->TargetDeviceObject, Irp);
-    }
-  } __finally {
-    DokanCompleteIrpRequest(Irp, status, 0);
-
-    DDbgPrint("<== DokanPnp\n");
-  }
-
-  return status;
 }
 
 BOOLEAN
@@ -406,6 +407,8 @@ VOID DokanPrintNTStatus(NTSTATUS Status) {
   PrintStatus(Status, STATUS_INVALID_HANDLE);
   PrintStatus(Status, STATUS_INSUFFICIENT_RESOURCES);
   PrintStatus(Status, STATUS_DEVICE_DOES_NOT_EXIST);
+  PrintStatus(Status, STATUS_INVALID_DEVICE_REQUEST);
+  PrintStatus(Status, STATUS_VOLUME_DISMOUNTED);
 }
 
 VOID DokanCompleteIrpRequest(__in PIRP Irp, __in NTSTATUS Status,

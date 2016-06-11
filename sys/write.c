@@ -1,9 +1,10 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2008 Hiroki Asakawa info@dokan-dev.net
+  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
-  http://dokan-dev.net/en
+  http://dokan-dev.github.io
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the Free
@@ -39,9 +40,17 @@ DokanDispatchWrite(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
     irpSp = IoGetCurrentIrpStackLocation(Irp);
     fileObject = irpSp->FileObject;
 
+    //
+    //  If this is a zero length write then return SUCCESS immediately.
+    //
+    if (irpSp->Parameters.Write.Length == 0) {
+
+      DDbgPrint("  Parameters.Write.Length == 0") return STATUS_SUCCESS;
+    }
+
     if (fileObject == NULL) {
       DDbgPrint("  fileObject == NULL\n");
-      status = STATUS_INVALID_PARAMETER;
+      status = STATUS_INVALID_DEVICE_REQUEST;
       __leave;
     }
 

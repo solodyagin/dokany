@@ -1,9 +1,10 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2008 Hiroki Asakawa info@dokan-dev.net
+  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
-  http://dokan-dev.net/en
+  http://dokan-dev.github.io
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU Lesser General Public License as published by the Free
@@ -18,8 +19,8 @@ You should have received a copy of the GNU Lesser General Public License along
 with this program. If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include <ntstatus.h>
 #include "dokani.h"
+#include <ntstatus.h>
 
 VOID DispatchCreate(HANDLE Handle, // This handle is not for a file. It is for
                                    // Dokan Device Driver(which is doing
@@ -111,6 +112,8 @@ VOID DispatchCreate(HANDLE Handle, // This handle is not for a file. It is for
     }
   }
 
+  DbgPrint("###Create %04d\n", eventId);
+
   // to open no directory file
   // event if this flag is not specified,
   // there is a case to open non directory file
@@ -118,7 +121,6 @@ VOID DispatchCreate(HANDLE Handle, // This handle is not for a file. It is for
     // DbgPrint("FILE_NON_DIRECTORY_FILE\n");
   }
 
-  DbgPrint("###Create %04d\n", eventId);
   // DbgPrint("### OpenInfo %X\n", openInfo);
   openInfo->EventId = eventId++;
 
@@ -185,7 +187,8 @@ VOID DispatchCreate(HANDLE Handle, // This handle is not for a file. It is for
         EventContext->Operation.Create.SecurityContext.DesiredAccess;
 
     // Call SetLastError() to reset the error code to a known state
-    // so we can check whether or not the user-mode driver set ERROR_ALREADY_EXISTS
+    // so we can check whether or not the user-mode driver set
+    // ERROR_ALREADY_EXISTS
     SetLastError(ERROR_SUCCESS);
 
     // This should call SetLastError(ERROR_ALREADY_EXISTS) when appropriate
@@ -211,7 +214,7 @@ VOID DispatchCreate(HANDLE Handle, // This handle is not for a file. It is for
   // FILE_OVERWRITTEN
   // FILE_SUPERSEDED
 
-  DbgPrint("CreateFile status = %lu - lastError = %d\n", status, lastError);
+  DbgPrint("CreateFile status = %lx - lastError = %d\n", status, lastError);
   if (status != STATUS_SUCCESS) {
     if (EventContext->Flags & SL_OPEN_TARGET_DIRECTORY) {
       DbgPrint("SL_OPEN_TARGET_DIRECTORY spcefied\n");
