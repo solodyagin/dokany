@@ -133,8 +133,13 @@ DokanFilterCallbackAcquireForCreateSection(__in PFS_FILTER_CALLBACK_DATA
 
 BOOLEAN
 DokanLookasideCreate(LOOKASIDE_LIST_EX *pCache, size_t cbElement) {
+#if _WIN32_WINNT > 0x601
+  NTSTATUS Status = ExInitializeLookasideListEx(
+      pCache, NULL, NULL, NonPagedPoolNx, 0, cbElement, TAG, 0);
+#else
   NTSTATUS Status = ExInitializeLookasideListEx(
       pCache, NULL, NULL, NonPagedPool, 0, cbElement, TAG, 0);
+#endif
 
   if (!NT_SUCCESS(Status)) {
     DDbgPrint("ExInitializeLookasideListEx failed, Status (0x%x)", Status);
@@ -155,8 +160,8 @@ Routine Description:
 
 Arguments:
 
-        DriverObject	- the system supplied driver object.
-        RegistryPath	- the system supplied registry path for this driver.
+        DriverObject    - the system supplied driver object.
+        RegistryPath    - the system supplied registry path for this driver.
 
 Return Value:
 
@@ -237,9 +242,14 @@ Return Value:
   fastIoDispatch->MdlWriteComplete = FsRtlMdlWriteCompleteDev;
 
   DriverObject->FastIoDispatch = fastIoDispatch;
-
+#if _WIN32_WINNT >= _WIN32_WINNT_WIN8
+  ExInitializeNPagedLookasideList(&DokanIrpEntryLookasideList, NULL, NULL,
+                                  POOL_NX_ALLOCATION, sizeof(IRP_ENTRY), TAG,
+                                  0);
+#else
   ExInitializeNPagedLookasideList(&DokanIrpEntryLookasideList, NULL, NULL, 0,
                                   sizeof(IRP_ENTRY), TAG, 0);
+#endif
 
 #if _WIN32_WINNT < 0x0501
   RtlInitUnicodeString(&functionName, L"FsRtlTeardownPerStreamContexts");
@@ -295,7 +305,7 @@ Routine Description:
 
 Arguments:
 
-        DriverObject	- the system supplied driver object.
+        DriverObject    - the system supplied driver object.
 
 Return Value:
 
@@ -317,6 +327,7 @@ Return Value:
   if (GetIdentifierType(dokanGlobal) == DGL) {
     DDbgPrint("  Delete Global DeviceObject\n");
 
+    KeSetEvent(&dokanGlobal->KillDeleteDeviceEvent, 0, FALSE);
     RtlInitUnicodeString(&symbolicLinkName, symbolicLinkBuf);
     IoDeleteSymbolicLink(&symbolicLinkName);
 
@@ -409,6 +420,7 @@ VOID DokanPrintNTStatus(NTSTATUS Status) {
   PrintStatus(Status, STATUS_DEVICE_DOES_NOT_EXIST);
   PrintStatus(Status, STATUS_INVALID_DEVICE_REQUEST);
   PrintStatus(Status, STATUS_VOLUME_DISMOUNTED);
+  PrintStatus(Status, STATUS_NO_SUCH_DEVICE);
 }
 
 VOID DokanCompleteIrpRequest(__in PIRP Irp, __in NTSTATUS Status,
@@ -456,6 +468,8 @@ VOID DokanNotifyReportChange0(__in PDokanFCB Fcb, __in PUNICODE_STRING FileName,
   DDbgPrint("<== DokanNotifyReportChange\n");
 }
 
+// DokanNotifyReportChange should be called with the Fcb at least share-locked.
+// due to the ro access to the FileName field.
 VOID DokanNotifyReportChange(__in PDokanFCB Fcb, __in ULONG FilterMatch,
                              __in ULONG Action) {
   ASSERT(Fcb != NULL);
@@ -491,13 +505,14 @@ VOID PrintIdType(__in VOID *Id) {
 
 BOOLEAN
 DokanCheckCCB(__in PDokanDCB Dcb, __in_opt PDokanCCB Ccb) {
+  PDokanVCB vcb;
   ASSERT(Dcb != NULL);
   if (GetIdentifierType(Dcb) != DCB) {
     PrintIdType(Dcb);
     return FALSE;
   }
 
-  if (Ccb == NULL || Ccb == 0) {
+  if (Ccb == NULL) {
     PrintIdType(Dcb);
     DDbgPrint("   ccb is NULL\n");
     return FALSE;
@@ -508,7 +523,8 @@ DokanCheckCCB(__in PDokanDCB Dcb, __in_opt PDokanCCB Ccb) {
     return FALSE;
   }
 
-  if (!Dcb->Mounted) {
+  vcb = Dcb->Vcb;
+  if (!vcb || IsUnmountPendingVcb(vcb)) {
     DDbgPrint("  Not mounted\n");
     return FALSE;
   }

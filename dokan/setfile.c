@@ -19,10 +19,6 @@ You should have received a copy of the GNU Lesser General Public License along
 with this program. If not, see <http://www.gnu.org/licenses/>.
 */
 
-#define WIN32_NO_STATUS
-#include <windows.h>
-#undef WIN32_NO_STATUS
-#include <ntstatus.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "dokani.h"
@@ -61,7 +57,7 @@ NTSTATUS
 DokanSetBasicInformation(PEVENT_CONTEXT EventContext, PDOKAN_FILE_INFO FileInfo,
                          PDOKAN_OPERATIONS DokanOperations) {
   FILETIME creation, lastAccess, lastWrite;
-  NTSTATUS status = STATUS_NOT_IMPLEMENTED;
+  NTSTATUS status;
 
   PFILE_BASIC_INFORMATION basicInfo = (PFILE_BASIC_INFORMATION)(
       (PCHAR)EventContext + EventContext->Operation.SetFile.BufferOffset);
@@ -102,9 +98,22 @@ DokanSetDispositionInformation(PEVENT_CONTEXT EventContext,
   if (!DokanOperations->DeleteFile || !DokanOperations->DeleteDirectory)
     return STATUS_NOT_IMPLEMENTED;
 
-  if (!dispositionInfo->DeleteFile) {
+  if (dispositionInfo->DeleteFile == FileInfo->DeleteOnClose) {
     return STATUS_SUCCESS;
   }
+
+  if (DokanOperations->GetFileInformation) {
+    BY_HANDLE_FILE_INFORMATION byHandleFileInfo;
+    ZeroMemory(&byHandleFileInfo, sizeof(BY_HANDLE_FILE_INFORMATION));
+    NTSTATUS result = DokanOperations->GetFileInformation(
+        EventContext->Operation.SetFile.FileName, &byHandleFileInfo, FileInfo);
+
+    if (result == STATUS_SUCCESS &&
+        (byHandleFileInfo.dwFileAttributes & FILE_ATTRIBUTE_READONLY) != 0)
+      return STATUS_CANNOT_DELETE;
+  }
+
+  FileInfo->DeleteOnClose = (dispositionInfo->DeleteFile) ? TRUE : FALSE;
 
   if (FileInfo->IsDirectory) {
     return DokanOperations->DeleteDirectory(
@@ -288,7 +297,7 @@ VOID DispatchSetInformation(HANDLE Handle, PEVENT_CONTEXT EventContext,
     }
   }
 
-  // DbgPrint("SetInfomation status = %d\n\n", status);
+  DbgPrint("\tDispatchSetInformation result =  %lx\n", status);
 
   SendEventInformation(Handle, eventInfo, sizeOfEventInfo, DokanInstance);
   free(eventInfo);

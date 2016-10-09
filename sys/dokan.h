@@ -44,9 +44,9 @@ extern ULONG g_Debug;
 extern LOOKASIDE_LIST_EX g_DokanCCBLookasideList;
 extern LOOKASIDE_LIST_EX g_DokanFCBLookasideList;
 
-#define DOKAN_GLOBAL_DEVICE_NAME L"\\Device\\Dokan" DOKAN_MAJOR_API_VERSION
+#define DOKAN_GLOBAL_DEVICE_NAME L"\\Device\\Dokan_" DOKAN_MAJOR_API_VERSION
 #define DOKAN_GLOBAL_SYMBOLIC_LINK_NAME                                        \
-  L"\\DosDevices\\Global\\Dokan" DOKAN_MAJOR_API_VERSION
+  L"\\DosDevices\\Global\\Dokan_" DOKAN_MAJOR_API_VERSION
 #define DOKAN_GLOBAL_FS_DISK_DEVICE_NAME                                       \
   L"\\Device\\DokanFs" DOKAN_MAJOR_API_VERSION
 #define DOKAN_GLOBAL_FS_CD_DEVICE_NAME                                         \
@@ -75,7 +75,19 @@ extern LOOKASIDE_LIST_EX g_DokanFCBLookasideList;
 #ifdef ExAllocatePool
 #undef ExAllocatePool
 #endif
+#if _WIN32_WINNT >= _WIN32_WINNT_WIN8
+#define ExAllocatePool(size) ExAllocatePoolWithTag(NonPagedPoolNx, size, TAG)
+#else
 #define ExAllocatePool(size) ExAllocatePoolWithTag(NonPagedPool, size, TAG)
+#endif
+
+#if _WIN32_WINNT >= _WIN32_WINNT_WIN8
+#define MmGetSystemAddressForMdlNormalSafe(mdl)                                \
+  MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority | MdlMappingNoExecute)
+#else
+#define MmGetSystemAddressForMdlNormalSafe(mdl)                                \
+  MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority)
+#endif
 
 #define DRIVER_CONTEXT_EVENT 2
 #define DRIVER_CONTEXT_IRP_ENTRY 3
@@ -87,6 +99,7 @@ extern LOOKASIDE_LIST_EX g_DokanFCBLookasideList;
 #define DOKAN_KEEPALIVE_TIMEOUT (1000 * 15) // in millisecond
 
 #if _WIN32_WINNT > 0x501
+
 #define DDbgPrint(...)                                                         \
   if (g_Debug) {                                                               \
     KdPrintEx(                                                                 \
@@ -117,6 +130,18 @@ extern NPAGED_LOOKASIDE_LIST DokanIrpEntryLookasideList;
   ExAllocateFromNPagedLookasideList(&DokanIrpEntryLookasideList)
 #define DokanFreeIrpEntry(IrpEntry)                                            \
   ExFreeToNPagedLookasideList(&DokanIrpEntryLookasideList, IrpEntry)
+
+//
+//  Undocumented definition of ExtensionFlags
+//
+
+#ifndef DOE_UNLOAD_PENDING
+#define DOE_UNLOAD_PENDING 0x00000001
+#define DOE_DELETE_PENDING 0x00000002
+#define DOE_REMOVE_PENDING 0x00000004
+#define DOE_REMOVE_PROCESSED 0x00000008
+#define DOE_START_PENDING 0x00000010
+#endif
 
 //
 // FSD_IDENTIFIER_TYPE
@@ -176,7 +201,12 @@ typedef struct _DOKAN_GLOBAL {
   // the list of waiting IRP for mount service
   IRP_LIST PendingService;
   IRP_LIST NotifyService;
+
+  PKTHREAD DeviceDeleteThread;
+
   LIST_ENTRY MountPointList;
+  LIST_ENTRY DeviceDeleteList;
+  KEVENT KillDeleteDeviceEvent;
 } DOKAN_GLOBAL, *PDOKAN_GLOBAL;
 
 // make sure Identifier is the top of struct
@@ -221,7 +251,6 @@ typedef struct _DokanDiskControlBlock {
 
   // When UseAltStream is 1, use Alternate stream
   USHORT UseAltStream;
-  USHORT Mounted;
   USHORT UseMountManager;
   USHORT MountGlobally;
   USHORT FileLockInUserMode;
@@ -230,13 +259,16 @@ typedef struct _DokanDiskControlBlock {
   ULONG SerialNumber;
 
   ULONG MountId;
-
+  ULONG Flags;
   LARGE_INTEGER TickCount;
 
   CACHE_MANAGER_CALLBACKS CacheManagerCallbacks;
   CACHE_MANAGER_CALLBACKS CacheManagerNoOpCallbacks;
 
   ULONG IrpTimeout;
+
+  IO_REMOVE_LOCK RemoveLock;
+
 } DokanDCB, *PDokanDCB;
 
 #define IS_DEVICE_READ_ONLY(DeviceObject)                                      \
@@ -263,34 +295,56 @@ typedef struct _DokanVolumeControlBlock {
   LONG FcbFreed;
   LONG CcbAllocated;
   LONG CcbFreed;
-
+  ULONG Flags;
   BOOLEAN HasEventWait;
 
 } DokanVCB, *PDokanVCB;
 
+// Flags for volume
+#define VCB_MOUNTED 0x00000004
+#define VCB_DISMOUNT_PENDING 0x00000008
+
+// Flags for device
+#define DCB_DELETE_PENDING 0x00000001
+
 typedef struct _DokanFileControlBlock {
+  // Locking: Identifier is read-only, no locks needed. 
   FSD_IDENTIFIER Identifier;
 
+  // Locking: FIXME
   FSRTL_ADVANCED_FCB_HEADER AdvancedFCBHeader;
+  // Locking: FIXME
   SECTION_OBJECT_POINTERS SectionObjectPointers;
 
+  // Locking: FIXME
   FAST_MUTEX AdvancedFCBHeaderMutex;
 
+  // Locking: FIXME is this needed in future?
   ERESOURCE MainResource;
+  // Locking: Lock for paging io.
   ERESOURCE PagingIoResource;
 
+  // Locking: Vcb pointer is read-only, no locks needed. 
   PDokanVCB Vcb;
+  // Locking: DokanFCBLock{RO,RW} and usually vcb lock
   LIST_ENTRY NextFCB;
+  // Locking: Used for DokanFCBLock{RO,RW}
   ERESOURCE Resource;
+  // Locking: DokanFCBLock{RO,RW}
   LIST_ENTRY NextCCB;
 
+  // Locking: DokanFCBLock{RO,RW}
   LONG FileCount;
 
+  // Locking: Use atomic flag operations - DokanFCBFlags*
   ULONG Flags;
+  // Locking: DokanFCBLock{RO,RW}
   SHARE_ACCESS ShareAccess;
 
+  // Locking: DokanFCBLock{RO,RW} - e.g. renames change this field.
   UNICODE_STRING FileName;
 
+  // Locking: DokanFCBLock{RO,RW}
   FILE_LOCK FileLock;
 
 #if (NTDDI_VERSION < NTDDI_WIN8)
@@ -298,6 +352,7 @@ typedef struct _DokanFileControlBlock {
   //  The following field is used by the oplock module
   //  to maintain current oplock information.
   //
+  // Locking: DokanFCBLock{RO,RW}
   OPLOCK Oplock;
 #endif
 
@@ -305,20 +360,33 @@ typedef struct _DokanFileControlBlock {
   // uint32 OpenHandleCount;
 } DokanFCB, *PDokanFCB;
 
+#define DokanFCBLockRO(fcb) do { KeEnterCriticalRegion(); ExAcquireResourceSharedLite(&fcb->Resource, TRUE); } while(0)
+#define DokanFCBLockRW(fcb) ExEnterCriticalRegionAndAcquireResourceExclusive(&fcb->Resource)
+#define DokanFCBUnlock(fcb) ExReleaseResourceAndLeaveCriticalRegion(&fcb->Resource)
+//#define DokanFCBLockRO(fcb) do { DDbgPrint("ZZZ LockRO %s\n", __FUNCTION__); KeEnterCriticalRegion(); ExAcquireResourceSharedLite(&fcb->Resource, TRUE); KeLeaveCriticalRegion(); } while(0)
+//#define DokanFCBLockRW(fcb) do { DDbgPrint("ZZZ LockRW %s\n", __FUNCTION__); KeEnterCriticalRegion(); ExAcquireResourceExclusiveLite(&fcb->Resource, TRUE); KeLeaveCriticalRegion(); } while(0)
+//#define DokanFCBUnlock(fcb) do { DDbgPrint("ZZZ Unlock %s\n", __FUNCTION__); KeEnterCriticalRegion(); ExReleaseResourceLite(&fcb->Resource); KeLeaveCriticalRegion(); } while(0)
+
 typedef struct _DokanContextControlBlock {
+  // Locking: Read only field. No locking needed.
   FSD_IDENTIFIER Identifier;
+  // Locking: Main lock for CCBs.
   ERESOURCE Resource;
+  // Locking: Read only field. No locking needed.
   PDokanFCB Fcb;
+  // Locking: Modified with the *FCB* lock held.
   LIST_ENTRY NextCCB;
+
   ULONG64 Context;
   ULONG64 UserContext;
 
   PWCHAR SearchPattern;
   ULONG SearchPatternLength;
 
+  // Locking: Use atomic flag operations - DokanCCBFlags*
   ULONG Flags;
 
-  int FileCount;
+  // Locking: Read only field. No locking needed.
   ULONG MountId;
 } DokanCCB, *PDokanCCB;
 
@@ -346,6 +414,13 @@ typedef struct _IRP_ENTRY {
   LARGE_INTEGER TickCount;
   PIRP_LIST IrpList;
 } IRP_ENTRY, *PIRP_ENTRY;
+
+typedef struct _DEVICE_ENTRY {
+  LIST_ENTRY ListEntry;
+  PDEVICE_OBJECT DiskDeviceObject;
+  PDEVICE_OBJECT VolumeDeviceObject;
+  ULONG Counter;
+} DEVICE_ENTRY, *PDEVICE_ENTRY;
 
 typedef struct _DRIVER_EVENT_CONTEXT {
   LIST_ENTRY ListEntry;
@@ -401,9 +476,6 @@ DokanDispatchQueryVolumeInformation(__in PDEVICE_OBJECT DeviceObject,
 NTSTATUS
 DokanDispatchSetVolumeInformation(__in PDEVICE_OBJECT DeviceObject,
                                   __in PIRP Irp);
-
-NTSTATUS
-DokanDispatchSetInformation(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp);
 
 NTSTATUS
 DokanDispatchDirectoryControl(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp);
@@ -463,7 +535,7 @@ NTSTATUS
 DokanDispatchRequest(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp);
 
 NTSTATUS
-DokanEventRelease(__in PDEVICE_OBJECT DeviceObject);
+DokanEventRelease(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp);
 
 NTSTATUS
 DokanGlobalEventRelease(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp);
@@ -566,7 +638,7 @@ VOID DokanNotifyReportChange0(__in PDokanFCB Fcb, __in PUNICODE_STRING FileName,
 VOID DokanNotifyReportChange(__in PDokanFCB Fcb, __in ULONG FilterMatch,
                              __in ULONG Action);
 
-PDokanFCB DokanAllocateFCB(__in PDokanVCB Vcb);
+PDokanFCB DokanAllocateFCB(__in PDokanVCB Vcb, __in PWCHAR FileName, __in ULONG FileNameLength);
 
 NTSTATUS
 DokanFreeFCB(__in PDokanFCB Fcb);
@@ -595,9 +667,17 @@ VOID DokanUpdateTimeout(__out PLARGE_INTEGER KickCount, __in ULONG Timeout);
 
 VOID DokanUnmount(__in PDokanDCB Dcb);
 
+BOOLEAN IsUnmountPending(__in PDEVICE_OBJECT DeviceObject);
+
+BOOLEAN IsMounted(__in PDEVICE_OBJECT DeviceObject);
+
+BOOLEAN IsDeletePending(__in PDEVICE_OBJECT DeviceObject);
+
+BOOLEAN IsUnmountPendingVcb(__in PDokanVCB vcb);
+
 PMOUNT_ENTRY
-FindMountEntry(__in PDOKAN_GLOBAL dokanGlobal,
-               __out PDOKAN_CONTROL DokanControl);
+FindMountEntry(__in PDOKAN_GLOBAL dokanGlobal, __in PDOKAN_CONTROL DokanControl,
+               __in BOOLEAN lockGlobal);
 
 VOID PrintIdType(__in VOID *Id);
 
@@ -617,5 +697,33 @@ NTSTATUS DokanSendVolumeArrivalNotification(PUNICODE_STRING DeviceName);
 
 static UNICODE_STRING sddl = RTL_CONSTANT_STRING(
     L"D:P(A;;GA;;;SY)(A;;GRGWGX;;;BA)(A;;GRGWGX;;;WD)(A;;GRGX;;;RC)");
+
+#define SetLongFlag(_F, _SF) DokanSetFlag(&(_F), (ULONG)(_SF))
+#define ClearLongFlag(_F, _SF) DokanClearFlag(&(_F), (ULONG)(_SF))
+
+__inline VOID DokanSetFlag(PULONG Flags, ULONG FlagBit) {
+  ULONG _ret = InterlockedOr((PLONG)Flags, FlagBit);
+  UNREFERENCED_PARAMETER(_ret);
+  ASSERT(*Flags == (_ret | FlagBit));
+}
+
+__inline VOID DokanClearFlag(PULONG Flags, ULONG FlagBit) {
+  ULONG _ret = InterlockedAnd((PLONG)Flags, ~FlagBit);
+  UNREFERENCED_PARAMETER(_ret);
+  ASSERT(*Flags == (_ret & (~FlagBit)));
+}
+
+#define IsFlagOn(a, b) ((BOOLEAN)(FlagOn(a, b) == b))
+
+#define DokanFCBFlagsGet(fcb) ((fcb)->Flags)
+#define DokanFCBFlagsIsSet(fcb, bit) (((fcb)->Flags)&(bit))
+#define DokanFCBFlagsSetBit(fcb, bit) SetLongFlag((fcb)->Flags, (bit))
+#define DokanFCBFlagsClearBit(fcb, bit) ClearLongFlag((fcb)->Flags, (bit))
+
+#define DokanCCBFlagsGet DokanFCBFlagsGet
+#define DokanCCBFlagsIsSet DokanFCBFlagsIsSet
+#define DokanCCBFlagsSetBit DokanFCBFlagsSetBit
+#define DokanCCBFlagsClearBit DokanFCBFlagsClearBit
+
 
 #endif // DOKAN_H_

@@ -33,7 +33,7 @@ Routine Description:
 Arguments:
 
         DeviceObject - Context for the activity.
-        Irp 		 - The device control argument block.
+        Irp          - The device control argument block.
 
 Return Value:
 
@@ -48,11 +48,15 @@ Return Value:
   NTSTATUS status = STATUS_INVALID_PARAMETER;
   ULONG readLength = 0;
   PDokanCCB ccb;
-  PDokanFCB fcb;
+  PDokanFCB fcb = NULL;
   PDokanVCB vcb;
   PVOID currentAddress = NULL;
   PEVENT_CONTEXT eventContext;
   ULONG eventLength;
+  BOOLEAN fcbLocked = FALSE;
+  BOOLEAN isPagingIo = FALSE;
+  BOOLEAN isSynchronousIo = FALSE;
+  BOOLEAN noCache = FALSE;
 
   __try {
 
@@ -66,6 +70,7 @@ Return Value:
     //
     if (irpSp->Parameters.Read.Length == 0) {
       DDbgPrint("  Parameters.Read.Length == 0 \n");
+      Irp->IoStatus.Information = 0;
       status = STATUS_SUCCESS;
       __leave;
     }
@@ -79,8 +84,7 @@ Return Value:
     if (fileObject == NULL && Irp->MdlAddress != NULL) {
       DDbgPrint("  Reads by File System Recognizers\n");
 
-      currentAddress =
-          MmGetSystemAddressForMdlSafe(Irp->MdlAddress, NormalPagePriority);
+      currentAddress = MmGetSystemAddressForMdlNormalSafe(Irp->MdlAddress);
       if (currentAddress == NULL) {
         status = STATUS_INSUFFICIENT_RESOURCES;
         __leave;
@@ -147,12 +151,34 @@ Return Value:
     fcb = ccb->Fcb;
     ASSERT(fcb != NULL);
 
-    if (fcb->Flags & DOKAN_FILE_DIRECTORY) {
+    if (DokanFCBFlagsIsSet(fcb, DOKAN_FILE_DIRECTORY)) {
       DDbgPrint("   DOKAN_FILE_DIRECTORY %p\n", fcb);
       status = STATUS_INVALID_PARAMETER;
       __leave;
     }
 
+    if (Irp->Flags & IRP_PAGING_IO) {
+      isPagingIo = TRUE;
+    }
+    if (fileObject->Flags & FO_SYNCHRONOUS_IO) {
+      isSynchronousIo = TRUE;
+    }
+
+    if (Irp->Flags & IRP_NOCACHE) {
+      noCache = TRUE;
+    }
+
+    if (!isPagingIo && (fileObject->SectionObjectPointer != NULL) &&
+        (fileObject->SectionObjectPointer->DataSectionObject != NULL)) {
+      ExAcquireResourceExclusiveLite(&fcb->PagingIoResource, TRUE);
+      CcFlushCache(&fcb->SectionObjectPointers,
+                   &irpSp->Parameters.Read.ByteOffset,
+                   irpSp->Parameters.Read.Length, NULL);
+      ExReleaseResourceLite(&fcb->PagingIoResource);
+    }
+
+    DokanFCBLockRO(fcb);
+    fcbLocked = TRUE;
     // length of EventContext is sum of file name length and itself
     eventLength = sizeof(EVENT_CONTEXT) + fcb->FileName.Length;
 
@@ -165,16 +191,16 @@ Return Value:
     eventContext->Context = ccb->UserContext;
     // DDbgPrint("   get Context %X\n", (ULONG)ccb->UserContext);
 
-    if (Irp->Flags & IRP_PAGING_IO) {
+    if (isPagingIo) {
       DDbgPrint("  Paging IO\n");
       eventContext->FileFlags |= DOKAN_PAGING_IO;
     }
-    if (fileObject->Flags & FO_SYNCHRONOUS_IO) {
+    if (isSynchronousIo) {
       DDbgPrint("  Synchronous IO\n");
       eventContext->FileFlags |= DOKAN_SYNCHRONOUS_IO;
     }
 
-    if (Irp->Flags & IRP_NOCACHE) {
+    if (noCache) {
       DDbgPrint("  Nocache\n");
       eventContext->FileFlags |= DOKAN_NOCACHE;
     }
@@ -203,8 +229,12 @@ Return Value:
       //  if FsRtlCheckOplock returns STATUS_PENDING the IRP has been posted
       //  to service an oplock break and we need to leave now.
       //
-      if (status == STATUS_PENDING) {
-        DDbgPrint("   FsRtlCheckOplock returned STATUS_PENDING\n");
+      if (status != STATUS_SUCCESS) {
+        if (status == STATUS_PENDING) {
+          DDbgPrint("   FsRtlCheckOplock returned STATUS_PENDING\n");
+        } else {
+          DokanFreeEventContext(eventContext);
+        }
         __leave;
       }
 
@@ -221,6 +251,8 @@ Return Value:
     // register this IRP to pending IPR list and make it pending status
     status = DokanRegisterPendingIrp(DeviceObject, Irp, eventContext, 0);
   } __finally {
+    if(fcbLocked)
+      DokanFCBUnlock(fcb);
 
     DokanCompleteIrpRequest(Irp, status, readLength);
 
@@ -258,7 +290,7 @@ VOID DokanCompleteRead(__in PIRP_ENTRY IrpEntry,
   // buffer which is used to copy Read info
   if (irp->MdlAddress) {
     // DDbgPrint("   use MDL Address\n");
-    buffer = MmGetSystemAddressForMdlSafe(irp->MdlAddress, NormalPagePriority);
+    buffer = MmGetSystemAddressForMdlNormalSafe(irp->MdlAddress);
   } else {
     // DDbgPrint("   use UserBuffer\n");
     buffer = irp->UserBuffer;

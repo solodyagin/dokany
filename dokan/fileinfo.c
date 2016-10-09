@@ -19,14 +19,10 @@ You should have received a copy of the GNU Lesser General Public License along
 with this program. If not, see <http://www.gnu.org/licenses/>.
 */
 
-#define WIN32_NO_STATUS
-#include <windows.h>
-#undef WIN32_NO_STATUS
 #include "dokani.h"
 #include "fileinfo.h"
 #include <ntstatus.h>
 #include <stdio.h>
-#include <stdlib.h>
 
 NTSTATUS
 DokanFillFileBasicInfo(PFILE_BASIC_INFORMATION BasicInfo,
@@ -100,6 +96,22 @@ DokanFillFilePositionInfo(PFILE_POSITION_INFORMATION PosInfo,
 }
 
 NTSTATUS
+DokanFillInternalInfo(PFILE_INTERNAL_INFORMATION InternalInfo,
+                      PBY_HANDLE_FILE_INFORMATION FileInfo,
+                      PULONG RemainingLength) {
+  if (*RemainingLength < sizeof(FILE_INTERNAL_INFORMATION)) {
+    return STATUS_BUFFER_OVERFLOW;
+  }
+
+  InternalInfo->IndexNumber.HighPart = FileInfo->nFileIndexHigh;
+  InternalInfo->IndexNumber.LowPart = FileInfo->nFileIndexLow;
+
+  *RemainingLength -= sizeof(FILE_INTERNAL_INFORMATION);
+
+  return STATUS_SUCCESS;
+}
+
+NTSTATUS
 DokanFillFileAllInfo(PFILE_ALL_INFORMATION AllInfo,
                      PBY_HANDLE_FILE_INFORMATION FileInfo,
                      PULONG RemainingLength, PEVENT_CONTEXT EventContext,
@@ -116,6 +128,12 @@ DokanFillFileAllInfo(PFILE_ALL_INFORMATION AllInfo,
   // FileStandardInformation
   DokanFillFileStandardInfo(&AllInfo->StandardInformation, FileInfo,
                             RemainingLength, DokanInstance);
+
+  // FileInternalInformation
+  DokanFillInternalInfo(&AllInfo->InternalInformation, FileInfo,
+                        RemainingLength);
+
+  AllInfo->EaInformation.EaSize = 0;
 
   // FilePositionInformation
   DokanFillFilePositionInfo(&AllInfo->PositionInformation, FileInfo,
@@ -247,23 +265,38 @@ DokanFillNetworkPhysicalNameInfo(
 }
 
 NTSTATUS
-DokanFillInternalInfo(PFILE_INTERNAL_INFORMATION InternalInfo,
-                      PBY_HANDLE_FILE_INFORMATION FileInfo,
-                      PULONG RemainingLength) {
-  if (*RemainingLength < sizeof(FILE_INTERNAL_INFORMATION)) {
+DokanFillIdInfo(PFILE_ID_INFORMATION IdInfo,
+                PBY_HANDLE_FILE_INFORMATION FileInfo, PULONG RemainingLength) {
+  if (*RemainingLength < sizeof(FILE_ID_INFORMATION)) {
     return STATUS_BUFFER_OVERFLOW;
   }
 
-  InternalInfo->IndexNumber.HighPart = FileInfo->nFileIndexHigh;
-  InternalInfo->IndexNumber.LowPart = FileInfo->nFileIndexLow;
+  IdInfo->VolumeSerialNumber = FileInfo->dwVolumeSerialNumber;
 
-  *RemainingLength -= sizeof(FILE_INTERNAL_INFORMATION);
+  ZeroMemory(IdInfo->FileId.Identifier, sizeof(IdInfo->FileId.Identifier));
+
+  ((DWORD *)(IdInfo->FileId.Identifier))[0] = FileInfo->nFileIndexLow;
+  ((DWORD *)(IdInfo->FileId.Identifier))[1] = FileInfo->nFileIndexHigh;
+
+  *RemainingLength -= sizeof(FILE_ID_INFORMATION);
 
   return STATUS_SUCCESS;
 }
 
+/**
+ * \struct DOKAN_FIND_STREAM_DATA
+ * \brief Dokan find stream list
+ *
+ * Used by FindStreams
+ */
 typedef struct _DOKAN_FIND_STREAM_DATA {
+  /**
+  * Stream data information link
+  */
   WIN32_FIND_STREAM_DATA FindStreamData;
+  /**
+  * Current list entry informations
+  */
   LIST_ENTRY ListEntry;
 } DOKAN_FIND_STREAM_DATA, *PDOKAN_FIND_STREAM_DATA;
 
@@ -405,13 +438,11 @@ VOID DispatchQueryInformation(HANDLE Handle, PEVENT_CONTEXT EventContext,
   if (DokanInstance->DokanOperations->GetFileInformation) {
     status = DokanInstance->DokanOperations->GetFileInformation(
         EventContext->Operation.File.FileName, &byHandleFileInfo, &fileInfo);
-  } else {
-    status = STATUS_NOT_IMPLEMENTED;
   }
 
   remainingLength = eventInfo->BufferLength;
 
-  DbgPrint("\tresult =  %lu\n", status);
+  DbgPrint("\tresult =  %lx\n", status);
 
   if (status != STATUS_SUCCESS) {
     eventInfo->Status = STATUS_INVALID_PARAMETER;
@@ -424,6 +455,12 @@ VOID DispatchQueryInformation(HANDLE Handle, PEVENT_CONTEXT EventContext,
       status =
           DokanFillFileBasicInfo((PFILE_BASIC_INFORMATION)eventInfo->Buffer,
                                  &byHandleFileInfo, &remainingLength);
+      break;
+
+    case FileIdInformation:
+      DbgPrint("\tFileIdInformation\n");
+      status = DokanFillIdInfo((PFILE_ID_INFORMATION)eventInfo->Buffer,
+                               &byHandleFileInfo, &remainingLength);
       break;
 
     case FileInternalInformation:
@@ -519,7 +556,7 @@ VOID DispatchQueryInformation(HANDLE Handle, PEVENT_CONTEXT EventContext,
         EventContext->Operation.File.BufferLength - remainingLength;
   }
 
-  DbgPrint("\tDispatchQueryInformation result =  %lu\n", status);
+  DbgPrint("\tDispatchQueryInformation result =  %lx\n", status);
 
   // information for FileSystem
   if (openInfo != NULL)

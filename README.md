@@ -8,6 +8,8 @@
 [![Average time to resolve an issue](http://isitmaintained.com/badge/resolution/dokan-dev/dokany.svg)](http://isitmaintained.com/project/dokan-dev/dokany "Average time to resolve an issue")
 [![Percentage of issues still open](http://isitmaintained.com/badge/open/dokan-dev/dokany.svg)](http://isitmaintained.com/project/dokan-dev/dokany "Percentage of issues still open")
 
+![Dokan Demo](http://dokan-dev.github.io/images/screencast.gif)
+
 ## What is Dokan
 When you want to create a new file system on Windows, other than FAT or NTFS, you need to develop a file system
 driver. Developing a device driver that works in kernel mode on
@@ -46,11 +48,12 @@ You can obtain source files from https://dokan-dev.github.io
 ## Environment
 Dokan works on
  * Windows 10
- * Windows 8.1
  * Windows Server 2012 R2
- * Windows 8
+ * Windows 8.1
  * Windows Server 2012
- * Windows 7
+ * Windows 8
+ * Windows Server 2008 R2 SP1
+ * Windows 7 SP1
 
 ## How it works
 Dokan library contains a user mode DLL (dokan1.dll) and a kernel mode
@@ -70,16 +73,16 @@ requests it received. The results of the callback routines will be
 sent back to the user program.
 
 For example, when Windows Explorer requests to open a directory, the
-OpenDirectory request will be sent to Dokan file system driver and the
-driver will invoke the OpenDirectory callback provided by the file system
-application. The results of this routine are sent back to Windows Explorer
-as the response to the OpenDirectory request. Therefore, the Dokan file
-system driver acts as a proxy between user programs and file system
-applications. The advantage of this approach is that it allows
+CreateFile with Direction option request will be sent to Dokan file system
+driver and the driver will invoke the CreateFile callback provided by
+the file system application. The results of this routine are sent back
+to Windows Explorer as the response to the CreateFile request. Therefore,
+the Dokan file system driver acts as a proxy between user programs and
+file system applications. The advantage of this approach is that it allows
 programmers to develop file systems in user mode which is safe and
 easy to debug.
  
-To learn more about Dokan file system development, see the [API documentation](https://github.com/dokan-dev/dokany/wiki/API).
+To learn more about Dokan file system development, see the [API documentation](https://dokan-dev.github.io/dokany-doc/html/).
 
 ## Build
 In short, download and install the [Visual Studio 2015](https://www.visualstudio.com/en-us/downloads/download-visual-studio-vs.aspx) with [SDK 10](https://dev.windows.com/en-us/downloads/windows-10-sdk) & [WDK 10](https://msdn.microsoft.com/en-us/windows/hardware/hh852365.aspx)

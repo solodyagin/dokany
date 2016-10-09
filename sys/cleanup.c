@@ -33,7 +33,7 @@ Routine Description:
 Arguments:
 
         DeviceObject - Context for the activity.
-        Irp 		 - The device control argument block.
+        Irp          - The device control argument block.
 
 Return Value:
 
@@ -86,30 +86,51 @@ Return Value:
     fcb = ccb->Fcb;
     ASSERT(fcb != NULL);
 
-    eventLength = sizeof(EVENT_CONTEXT) + fcb->FileName.Length;
-    eventContext = AllocateEventContext(vcb->Dcb, Irp, eventLength, ccb);
-
-    if (eventContext == NULL) {
-      status = STATUS_INSUFFICIENT_RESOURCES;
-      __leave;
-    }
-
     if (fileObject->SectionObjectPointer != NULL &&
         fileObject->SectionObjectPointer->DataSectionObject != NULL) {
       CcFlushCache(&fcb->SectionObjectPointers, NULL, 0, NULL);
       CcPurgeCacheSection(&fcb->SectionObjectPointers, NULL, 0, FALSE);
       CcUninitializeCacheMap(fileObject, NULL, NULL);
     }
+
+    DokanFCBLockRW(fcb);
+
+    eventLength = sizeof(EVENT_CONTEXT) + fcb->FileName.Length;
+    eventContext = AllocateEventContext(vcb->Dcb, Irp, eventLength, ccb);
+
+    if (eventContext == NULL) {
+      status = STATUS_INSUFFICIENT_RESOURCES;
+      DokanFCBUnlock(fcb);
+      __leave;
+    }
+
     fileObject->Flags |= FO_CLEANUP_COMPLETE;
 
     eventContext->Context = ccb->UserContext;
-    eventContext->FileFlags |= fcb->Flags;
+    eventContext->FileFlags |= DokanCCBFlagsGet(ccb);
     // DDbgPrint("   get Context %X\n", (ULONG)ccb->UserContext);
 
     // copy the filename to EventContext from ccb
     eventContext->Operation.Cleanup.FileNameLength = fcb->FileName.Length;
     RtlCopyMemory(eventContext->Operation.Cleanup.FileName,
                   fcb->FileName.Buffer, fcb->FileName.Length);
+
+    status = FsRtlCheckOplock(DokanGetFcbOplock(fcb), Irp, eventContext,
+                              DokanOplockComplete, DokanPrePostIrp);
+    DokanFCBUnlock(fcb);
+
+    //
+    //  if FsRtlCheckOplock returns STATUS_PENDING the IRP has been posted
+    //  to service an oplock break and we need to leave now.
+    //
+    if (status != STATUS_SUCCESS) {
+      if (status == STATUS_PENDING) {
+        DDbgPrint("   FsRtlCheckOplock returned STATUS_PENDING\n");
+      } else {
+        DokanFreeEventContext(eventContext);
+      }
+      __leave;
+    }
 
     // register this IRP to pending IRP list
     status = DokanRegisterPendingIrp(DeviceObject, Irp, eventContext, 0);
@@ -150,10 +171,21 @@ VOID DokanCompleteCleanup(__in PIRP_ENTRY IrpEntry,
 
   fcb = ccb->Fcb;
   ASSERT(fcb != NULL);
+  DokanFCBLockRW(fcb);
 
   vcb = fcb->Vcb;
 
   status = EventInfo->Status;
+
+  if (DokanFCBFlagsIsSet(fcb, DOKAN_DELETE_ON_CLOSE)) {
+    if (DokanFCBFlagsIsSet(fcb, DOKAN_FILE_DIRECTORY)) {
+      DokanNotifyReportChange(fcb, FILE_NOTIFY_CHANGE_DIR_NAME,
+                              FILE_ACTION_REMOVED);
+    } else {
+      DokanNotifyReportChange(fcb, FILE_NOTIFY_CHANGE_FILE_NAME,
+                              FILE_ACTION_REMOVED);
+    }
+  }
 
   //
   //  Unlock all outstanding file locks.
@@ -161,11 +193,12 @@ VOID DokanCompleteCleanup(__in PIRP_ENTRY IrpEntry,
   (VOID) FsRtlFastUnlockAll(&fcb->FileLock, fileObject,
                             IoGetRequestorProcess(irp), NULL);
 
-  if (fcb->Flags & DOKAN_FILE_DIRECTORY) {
+  if (DokanFCBFlagsIsSet(fcb, DOKAN_FILE_DIRECTORY)) {
     FsRtlNotifyCleanup(vcb->NotifySync, &vcb->DirNotifyList, ccb);
   }
 
   IoRemoveShareAccess(irpSp->FileObject, &fcb->ShareAccess);
+  DokanFCBUnlock(fcb);
 
   DokanCompleteIrpRequest(irp, status, 0);
 

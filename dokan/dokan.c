@@ -19,22 +19,13 @@ You should have received a copy of the GNU Lesser General Public License along
 with this program. If not, see <http://www.gnu.org/licenses/>.
 */
 
-#define WIN32_NO_STATUS
-#include <windows.h>
-#undef WIN32_NO_STATUS
-
 #include "dokani.h"
 #include "fileinfo.h"
 #include "list.h"
 #include <conio.h>
-#include <locale.h>
-#include <ntstatus.h>
 #include <process.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <tchar.h>
-#include <winioctl.h>
 
 #define DokanMapKernelBit(dest, src, userBit, kernelBit)                       \
   if (((src) & (kernelBit)) == (kernelBit))                                    \
@@ -288,10 +279,10 @@ int DOKANAPI DokanMain(PDOKAN_OPTIONS DokanOptions,
   }
 
   if (!DokanMount(instance->MountPoint, instance->DeviceName, DokanOptions)) {
-	  SendReleaseIRP(instance->DeviceName);
-	  DokanDbgPrint("Dokan Error: DokanMount Failed\n");
-	  CloseHandle(device);
-	  return DOKAN_MOUNT_ERROR;
+    SendReleaseIRP(instance->DeviceName);
+    DokanDbgPrint("Dokan Error: DokanMount Failed\n");
+    CloseHandle(device);
+    return DOKAN_MOUNT_ERROR;
   }
 
   // Here we should have been mounter by mountmanager thanks to
@@ -299,11 +290,11 @@ int DOKANAPI DokanMain(PDOKAN_OPTIONS DokanOptions,
   DbgPrintW(L"mounted: %s -> %s\n", instance->MountPoint, instance->DeviceName);
 
   if (DokanOperations->Mounted) {
-	  DOKAN_FILE_INFO fileInfo;
-	  RtlZeroMemory(&fileInfo, sizeof(DOKAN_FILE_INFO));
-	  fileInfo.DokanOptions = DokanOptions;
-	  // ignore return value
-	  DokanOperations->Mounted(&fileInfo);
+    DOKAN_FILE_INFO fileInfo;
+    RtlZeroMemory(&fileInfo, sizeof(DOKAN_FILE_INFO));
+    fileInfo.DokanOptions = DokanOptions;
+    // ignore return value
+    DokanOperations->Mounted(&fileInfo);
   }
 
   // wait for thread terminations
@@ -350,7 +341,7 @@ void ALIGN_ALLOCATION_SIZE(PLARGE_INTEGER size, PDOKAN_OPTIONS DokanOptions) {
 }
 
 UINT WINAPI DokanLoop(PDOKAN_INSTANCE DokanInstance) {
-  HANDLE device;
+  HANDLE device = INVALID_HANDLE_VALUE;
   char *buffer = NULL;
   BOOL status;
   ULONG returnedLength;
@@ -366,29 +357,30 @@ UINT WINAPI DokanLoop(PDOKAN_INSTANCE DokanInstance) {
   }
   RtlZeroMemory(buffer, sizeof(char) * EVENT_CONTEXT_MAX_SIZE);
 
-  device = CreateFile(GetRawDeviceName(DokanInstance->DeviceName, rawDeviceName,
-                                       MAX_PATH),         // lpFileName
-                      GENERIC_READ | GENERIC_WRITE,       // dwDesiredAccess
-                      FILE_SHARE_READ | FILE_SHARE_WRITE, // dwShareMode
-                      NULL,          // lpSecurityAttributes
-                      OPEN_EXISTING, // dwCreationDistribution
-                      0,             // dwFlagsAndAttributes
-                      NULL           // hTemplateFile
-                      );
-
-  if (device == INVALID_HANDLE_VALUE) {
-    DbgPrint(
-        "Dokan Error: CreateFile failed %ws: %d\n",
-        GetRawDeviceName(DokanInstance->DeviceName, rawDeviceName, MAX_PATH),
-        GetLastError());
-    free(buffer);
-    result = (DWORD)-1;
-    _endthreadex(result);
-    return result;
-  }
-
   status = TRUE;
   while (status) {
+
+    device =
+        CreateFile(GetRawDeviceName(DokanInstance->DeviceName, rawDeviceName,
+                                    MAX_PATH),         // lpFileName
+                   GENERIC_READ | GENERIC_WRITE,       // dwDesiredAccess
+                   FILE_SHARE_READ | FILE_SHARE_WRITE, // dwShareMode
+                   NULL,                               // lpSecurityAttributes
+                   OPEN_EXISTING,                      // dwCreationDistribution
+                   0,                                  // dwFlagsAndAttributes
+                   NULL                                // hTemplateFile
+                   );
+
+    if (device == INVALID_HANDLE_VALUE) {
+      DbgPrint(
+          "Dokan Error: CreateFile failed %ws: %d\n",
+          GetRawDeviceName(DokanInstance->DeviceName, rawDeviceName, MAX_PATH),
+          GetLastError());
+      free(buffer);
+      result = (DWORD)-1;
+      _endthreadex(result);
+      return result;
+    }
 
     status = DeviceIoControl(
         device,           // Handle to device
@@ -408,6 +400,7 @@ UINT WINAPI DokanLoop(PDOKAN_INSTANCE DokanInstance) {
       if (lastError == ERROR_NO_SYSTEM_RESOURCES) {
         DbgPrint("Processing will continue\n");
         status = TRUE;
+        CloseHandle(device);
         Sleep(200);
         continue;
       }
@@ -422,6 +415,7 @@ UINT WINAPI DokanLoop(PDOKAN_INSTANCE DokanInstance) {
       if (context->MountId != DokanInstance->MountId) {
         DbgPrint("Dokan Error: Invalid MountId (expected:%d, acctual:%d)\n",
                  DokanInstance->MountId, context->MountId);
+        CloseHandle(device);
         continue;
       }
 
@@ -472,6 +466,8 @@ UINT WINAPI DokanLoop(PDOKAN_INSTANCE DokanInstance) {
     } else {
       DbgPrint("ReturnedLength %d\n", returnedLength);
     }
+
+    CloseHandle(device);
   }
 
   CloseHandle(device);
@@ -826,7 +822,7 @@ BOOL WINAPI DllMain(HINSTANCE Instance, DWORD Reason, LPVOID Reserved) {
       PLIST_ENTRY entry = RemoveHeadList(&g_InstanceList);
       PDOKAN_INSTANCE instance =
           CONTAINING_RECORD(entry, DOKAN_INSTANCE, ListEntry);
-      DokanRemoveMountPoint(instance->MountPoint);
+      DokanRemoveMountPointEx(instance->MountPoint, FALSE);
       free(instance);
     }
 
@@ -835,6 +831,43 @@ BOOL WINAPI DllMain(HINSTANCE Instance, DWORD Reason, LPVOID Reserved) {
   } break;
   }
   return TRUE;
+}
+
+// We are using DesiredAccess directly from the IRP_MJ_CREATE.
+// This DesiredAccess has been converted from generic rights (user CreateFile request) to standard rights.
+// https://msdn.microsoft.com/windows/hardware/drivers/ifs/access-mask
+// TODO Merge it with DokanMapKernelToUserCreateFileFlags for Dokan 1.1.0 (break API)
+ACCESS_MASK DOKANAPI
+DokanMapStandardToGenericAccess(ACCESS_MASK DesiredAccess) {
+  BOOL genericRead = FALSE, genericWrite = FALSE, genericExecute = FALSE,
+       genericAll = FALSE;
+  if ((DesiredAccess & FILE_GENERIC_READ) == FILE_GENERIC_READ) {
+    DesiredAccess |= GENERIC_READ;
+    genericRead = TRUE;
+  }
+  if ((DesiredAccess & FILE_GENERIC_WRITE) == FILE_GENERIC_WRITE) {
+    DesiredAccess |= GENERIC_WRITE;
+    genericWrite = TRUE;
+  }
+  if ((DesiredAccess & FILE_GENERIC_EXECUTE) == FILE_GENERIC_EXECUTE) {
+    DesiredAccess |= GENERIC_EXECUTE;
+    genericExecute = TRUE;
+  }
+  if ((DesiredAccess & FILE_ALL_ACCESS) == FILE_ALL_ACCESS) {
+    DesiredAccess |= GENERIC_ALL;
+    genericAll = TRUE;
+  }
+
+  if (genericRead)
+    DesiredAccess &= ~FILE_GENERIC_READ;
+  if (genericWrite)
+    DesiredAccess &= ~FILE_GENERIC_WRITE;
+  if (genericExecute)
+    DesiredAccess &= ~FILE_GENERIC_EXECUTE;
+  if (genericAll)
+    DesiredAccess &= ~FILE_ALL_ACCESS;
+
+  return DesiredAccess;
 }
 
 void DOKANAPI DokanMapKernelToUserCreateFileFlags(

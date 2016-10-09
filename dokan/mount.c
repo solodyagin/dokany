@@ -23,29 +23,56 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 #include <Dbt.h>
 #include <Shlobj.h>
 #include <stdio.h>
-#include <windows.h>
 
+/**
+ * \struct REPARSE_DATA_BUFFER
+ * \brief Contains reparse point data for a Microsoft reparse point.
+ *
+ * Used to create a dokan mount point in CreateMountPoint function.
+ */
 typedef struct _REPARSE_DATA_BUFFER {
+  /**
+  * Reparse point tag. Must be a Microsoft reparse point tag.
+  */
   ULONG ReparseTag;
+  /**
+  * Size, in bytes, of the reparse data in the DataBuffer member.
+  */
   USHORT ReparseDataLength;
+  /**
+  * Length, in bytes, of the unparsed portion of the file name pointed
+  * to by the FileName member of the associated file object.
+  */
   USHORT Reserved;
   union {
     struct {
+      /** Offset, in bytes, of the substitute name string in the PathBuffer array. */
       USHORT SubstituteNameOffset;
+      /** Length, in bytes, of the substitute name string. */
       USHORT SubstituteNameLength;
+      /** Offset, in bytes, of the print name string in the PathBuffer array. */
       USHORT PrintNameOffset;
+      /** Length, in bytes, of the print name string. */
       USHORT PrintNameLength;
+      /** Used to indicate if the given symbolic link is an absolute or relative symbolic link. */
       ULONG Flags;
+      /** First character of the path string. This is followed in memory by the remainder of the string. */
       WCHAR PathBuffer[1];
     } SymbolicLinkReparseBuffer;
     struct {
+      /** Offset, in bytes, of the substitute name string in the PathBuffer array. */
       USHORT SubstituteNameOffset;
+      /** Length, in bytes, of the substitute name string. */
       USHORT SubstituteNameLength;
+      /** Offset, in bytes, of the print name string in the PathBuffer array. */
       USHORT PrintNameOffset;
+      /** Length, in bytes, of the print name string. */
       USHORT PrintNameLength;
+      /** First character of the path string. */
       WCHAR PathBuffer[1];
     } MountPointReparseBuffer;
     struct {
+      /** Microsoft-defined data for the reparse point. */
       UCHAR DataBuffer[1];
     } GenericReparseBuffer;
   } DUMMYUNIONNAME;
@@ -262,6 +289,11 @@ BOOL DOKANAPI DokanNetworkProviderInstall() {
     pBuf[length--] = '\0';
   wcscat_s(pBuf, sizeof(pBuf) / sizeof(WCHAR), DOKAN_BINARY_NAME);
 
+  if (GetFileAttributes(pBuf) == INVALID_FILE_ATTRIBUTES) {
+    DokanDbgPrintW(L"Error the file '%s' does not exist.\n", pBuf);
+    return FALSE;
+  }
+
   RegCreateKeyEx(HKEY_LOCAL_MACHINE, DOKAN_NP_SERVICE_KEY L"\\NetworkProvider",
                  0, NULL, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &key,
                  &position);
@@ -432,7 +464,30 @@ BOOL DeleteMountPoint(LPCWSTR MountPoint) {
   return result;
 }
 
-void DokanBroadcastLink(WCHAR cLetter, BOOL bRemoved) {
+BOOL EnableTokenPrivilege(LPCTSTR lpszSystemName, BOOL bEnable) {
+  HANDLE hToken = NULL;
+  if (OpenProcessToken(GetCurrentProcess(),
+                       TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+    TOKEN_PRIVILEGES tp = {0};
+    if (LookupPrivilegeValue(NULL, lpszSystemName, &tp.Privileges[0].Luid)) {
+      tp.PrivilegeCount = 1;
+      tp.Privileges[0].Attributes = (bEnable ? SE_PRIVILEGE_ENABLED : 0);
+
+      if (AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(TOKEN_PRIVILEGES),
+                                (PTOKEN_PRIVILEGES)NULL, NULL)) {
+        CloseHandle(hToken);
+        return GetLastError() == ERROR_SUCCESS;
+      }
+    }
+  }
+
+  if (hToken) {
+    CloseHandle(hToken);
+  }
+  return FALSE;
+}
+
+void DokanBroadcastLink(WCHAR cLetter, BOOL bRemoved, BOOL safe) {
   DWORD receipients;
   DWORD device_event;
   DEV_BROADCAST_VOLUME params;
@@ -445,6 +500,11 @@ void DokanBroadcastLink(WCHAR cLetter, BOOL bRemoved) {
   }
 
   receipients = BSM_APPLICATIONS;
+  // Unsafe to call Advapi32.dll during DLL_PROCESS_DETACH
+  if (safe && EnableTokenPrivilege(SE_TCB_NAME, TRUE)) {
+    receipients |= BSM_ALLDESKTOPS;
+  }
+
   device_event = bRemoved ? DBT_DEVICEREMOVECOMPLETE : DBT_DEVICEARRIVAL;
 
   ZeroMemory(&params, sizeof(params));
@@ -462,14 +522,12 @@ void DokanBroadcastLink(WCHAR cLetter, BOOL bRemoved) {
              GetLastError());
   }
 
-  // Cannot SHChangeNotify during DLL_PROCESS_DETACH cannot
-  // ole32.dll is probably already unload
-  if (bRemoved)
-    return;
-
-  drive[0] = towupper(cLetter);
-  wEventId = bRemoved ? SHCNE_DRIVEREMOVED : SHCNE_DRIVEADD;
-  SHChangeNotify(wEventId, SHCNF_PATH, drive, NULL);
+  // Unsafe to call ole32.dll during DLL_PROCESS_DETACH
+  if (safe) {
+    drive[0] = towupper(cLetter);
+    wEventId = bRemoved ? SHCNE_DRIVEREMOVED : SHCNE_DRIVEADD;
+    SHChangeNotify(wEventId, SHCNF_PATH, drive, NULL);
+  }
 }
 
 BOOL DokanMount(LPCWSTR MountPoint, LPCWSTR DeviceName,
@@ -485,13 +543,13 @@ BOOL DokanMount(LPCWSTR MountPoint, LPCWSTR DeviceName,
       return CreateMountPoint(MountPoint, DeviceName);
     } else {
       // Notify applications / explorer
-      DokanBroadcastLink(MountPoint[0], FALSE);
+      DokanBroadcastLink(MountPoint[0], FALSE, TRUE);
     }
   }
   return TRUE;
 }
 
-BOOL DOKANAPI DokanRemoveMountPoint(LPCWSTR MountPoint) {
+BOOL DOKANAPI DokanRemoveMountPointEx(LPCWSTR MountPoint, BOOL Safe) {
   if (MountPoint != NULL) {
     size_t length = wcslen(MountPoint);
     if (length > 0) {
@@ -510,20 +568,24 @@ BOOL DOKANAPI DokanRemoveMountPoint(LPCWSTR MountPoint) {
       if (SendGlobalReleaseIRP(mountPoint)) {
         if (!IsMountPointDriveLetter(MountPoint)) {
           length = wcslen(mountPoint);
-          if (length+1 < MAX_PATH) {
+          if (length + 1 < MAX_PATH) {
             mountPoint[length] = L'\\';
-            mountPoint[length+1] = L'\0';
+            mountPoint[length + 1] = L'\0';
             // Required to remove reparse point (could also be done through
             // FSCTL_DELETE_REPARSE_POINT with DeleteMountPoint function)
             DeleteVolumeMountPoint(mountPoint);
           }
         } else {
           // Notify applications / explorer
-          DokanBroadcastLink(MountPoint[0], TRUE);
+          DokanBroadcastLink(MountPoint[0], TRUE, Safe);
           return TRUE;
         }
       }
     }
   }
   return FALSE;
+}
+
+BOOL DOKANAPI DokanRemoveMountPoint(LPCWSTR MountPoint) {
+  return DokanRemoveMountPointEx(MountPoint, TRUE);
 }

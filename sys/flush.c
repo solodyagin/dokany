@@ -26,7 +26,7 @@ DokanDispatchFlush(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
   PIO_STACK_LOCATION irpSp;
   PFILE_OBJECT fileObject;
   NTSTATUS status = STATUS_INVALID_PARAMETER;
-  PDokanFCB fcb;
+  PDokanFCB fcb = NULL;
   PDokanCCB ccb;
   PDokanVCB vcb;
   PEVENT_CONTEXT eventContext;
@@ -58,6 +58,7 @@ DokanDispatchFlush(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
 
     fcb = ccb->Fcb;
     ASSERT(fcb != NULL);
+    DokanFCBLockRO(fcb);
 
     eventLength = sizeof(EVENT_CONTEXT) + fcb->FileName.Length;
     eventContext = AllocateEventContext(vcb->Dcb, Irp, eventLength, ccb);
@@ -78,10 +79,28 @@ DokanDispatchFlush(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
     CcUninitializeCacheMap(fileObject, NULL, NULL);
     // fileObject->Flags &= FO_CLEANUP_COMPLETE;
 
+    status = FsRtlCheckOplock(DokanGetFcbOplock(fcb), Irp, eventContext,
+                              DokanOplockComplete, DokanPrePostIrp);
+
+    //
+    //  if FsRtlCheckOplock returns STATUS_PENDING the IRP has been posted
+    //  to service an oplock break and we need to leave now.
+    //
+    if (status != STATUS_SUCCESS) {
+      if (status == STATUS_PENDING) {
+        DDbgPrint("   FsRtlCheckOplock returned STATUS_PENDING\n");
+      } else {
+        DokanFreeEventContext(eventContext);
+      }
+      __leave;
+    }
+
     // register this IRP to waiting IRP list and make it pending status
     status = DokanRegisterPendingIrp(DeviceObject, Irp, eventContext, 0);
 
   } __finally {
+    if(fcb)
+      DokanFCBUnlock(fcb);
 
     DokanCompleteIrpRequest(Irp, status, 0);
 

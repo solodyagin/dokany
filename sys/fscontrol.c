@@ -27,7 +27,7 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
   ULONG FsControlCode;
   PDokanDCB Dcb;
   PDokanVCB Vcb;
-  PDokanFCB Fcb;
+  PDokanFCB Fcb = NULL;
   PDokanCCB Ccb;
   PFILE_OBJECT fileObject;
   PIRP Irp = *pIrp;
@@ -101,7 +101,7 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
   //  Read-Handle
   //  oplock only.
   //
-  if (FlagOn(Fcb->Flags, DOKAN_FILE_DIRECTORY) &&
+  if ((DokanFCBFlagsIsSet(Fcb, DOKAN_FILE_DIRECTORY)) &&
       ((FsControlCode != FSCTL_REQUEST_OPLOCK) ||
        !FsRtlOplockIsSharedRequest(Irp))) {
 
@@ -131,7 +131,8 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
             ) {
 
       AcquiredVcb = ExAcquireResourceSharedLite(&(Fcb->Vcb->Resource), TRUE);
-      AcquiredFcb = ExAcquireResourceSharedLite(&(Fcb->Resource), TRUE);
+      DokanFCBLockRW(Fcb);
+      AcquiredFcb = TRUE;
 
 #if (NTDDI_VERSION >= NTDDI_WIN7)
       if (!Dcb->FileLockInUserMode && FsRtlOplockIsSharedRequest(Irp)) {
@@ -142,7 +143,7 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
         //
         //  Byte-range locks are only valid on files.
         //
-        if (!FlagOn(Fcb->Flags, DOKAN_FILE_DIRECTORY)) {
+        if (!DokanFCBFlagsIsSet(Fcb, DOKAN_FILE_DIRECTORY)) {
 
 //
 //  Set OplockCount to nonzero if FsRtl denies access
@@ -173,7 +174,8 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
 #endif
                    ) {
 
-      AcquiredFcb = ExAcquireResourceSharedLite(&(Fcb->Resource), TRUE);
+      DokanFCBLockRO(Fcb);
+      AcquiredFcb = TRUE;
 #if (NTDDI_VERSION >= NTDDI_WIN7)
     } else if (FsControlCode == FSCTL_REQUEST_OPLOCK) {
       //
@@ -202,7 +204,7 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
           FlagOn(InputBuffer->RequestedOplockLevel, OPLOCK_LEVEL_CACHE_HANDLE))
 #endif
              ) &&
-        FlagOn(Fcb->Flags, DOKAN_DELETE_ON_CLOSE)) {
+        DokanFCBFlagsIsSet(Fcb, DOKAN_DELETE_ON_CLOSE)) {
 
       DDbgPrint("    DokanOplockRequest STATUS_DELETE_PENDING\n");
       return STATUS_DELETE_PENDING;
@@ -229,7 +231,7 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
     }
 
     if (AcquiredFcb) {
-      ExReleaseResourceLite(&(Fcb->Resource));
+      DokanFCBUnlock(Fcb);
     }
 
     DDbgPrint("    DokanOplockRequest return 0x%x\n", Status);
@@ -539,8 +541,17 @@ NTSTATUS DokanMountVolume(__in PDEVICE_OBJECT DiskDevice, __in PIRP Irp) {
     DDbgPrint("   Not DokanDiskDevice\n");
     return status;
   }
+
+  if (IsDeletePending(dcb->DeviceObject)) {
+    DDbgPrint(" This is a remount try of the device");
+    return STATUS_DEVICE_REMOVED;
+  }
+
   BOOLEAN isNetworkFileSystem =
       (dcb->VolumeDeviceType == FILE_DEVICE_NETWORK_FILE_SYSTEM);
+
+  DDbgPrint(" Mounting volume using MountPoint %wZ device %wZ \n",
+            dcb->MountPoint, dcb->DiskDeviceName);
 
   if (!isNetworkFileSystem) {
     status = IoCreateDevice(DriverObject,               // DriverObject
@@ -599,12 +610,14 @@ NTSTATUS DokanMountVolume(__in PDEVICE_OBJECT DiskDevice, __in PIRP Irp) {
   //
   // Establish user-buffer access method.
   //
-  volDeviceObject->Flags |= DO_DIRECT_IO;
+  SetLongFlag(volDeviceObject->Flags, DO_DIRECT_IO);
+  ClearLongFlag(volDeviceObject->Flags, DO_DEVICE_INITIALIZING);
+  SetLongFlag(vcb->Flags, VCB_MOUNTED);
 
-  volDeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
-
-  dcb->Mounted = 1;
   ObReferenceObject(volDeviceObject);
+
+  DDbgPrint("  ExAcquireResourceExclusiveLite dcb resource \n")
+      ExAcquireResourceExclusiveLite(&dcb->Resource, TRUE);
 
   // set the device on dokanControl
   RtlZeroMemory(&dokanControl, sizeof(dokanControl));
@@ -614,13 +627,16 @@ NTSTATUS DokanMountVolume(__in PDEVICE_OBJECT DiskDevice, __in PIRP Irp) {
     RtlCopyMemory(dokanControl.UNCName, dcb->UNCName->Buffer,
                   dcb->UNCName->Length);
   }
-  mountEntry = FindMountEntry(dcb->Global, &dokanControl);
+  mountEntry = FindMountEntry(dcb->Global, &dokanControl, TRUE);
   if (mountEntry != NULL) {
     mountEntry->MountControl.DeviceObject = volDeviceObject;
   } else {
+    ExReleaseResourceLite(&dcb->Resource);
     DDbgPrint("MountEntry not found. This way the dokanControl does not have "
-              "the DeviceObject")
+              "the DeviceObject \n") return STATUS_DEVICE_REMOVED;
   }
+
+  ExReleaseResourceLite(&dcb->Resource);
 
   // Start check thread
   ExAcquireResourceExclusiveLite(&dcb->Resource, TRUE);
@@ -640,6 +656,9 @@ NTSTATUS DokanMountVolume(__in PDEVICE_OBJECT DiskDevice, __in PIRP Irp) {
   if (isNetworkFileSystem) {
     DokanRegisterUncProviderSystem(dcb);
   }
+
+  DDbgPrint("  Mounting successfully done \n");
+
   return STATUS_SUCCESS;
 }
 
@@ -667,25 +686,25 @@ DokanDispatchFileSystemControl(__in PDEVICE_OBJECT DeviceObject,
 
     switch (irpSp->MinorFunction) {
     case IRP_MN_KERNEL_CALL:
-      DDbgPrint("	 IRP_MN_KERNEL_CALL\n");
+      DDbgPrint("     IRP_MN_KERNEL_CALL\n");
       break;
 
     case IRP_MN_LOAD_FILE_SYSTEM:
-      DDbgPrint("	 IRP_MN_LOAD_FILE_SYSTEM\n");
+      DDbgPrint("     IRP_MN_LOAD_FILE_SYSTEM\n");
       break;
 
     case IRP_MN_MOUNT_VOLUME: {
-      DDbgPrint("	 IRP_MN_MOUNT_VOLUME\n");
+      DDbgPrint("     IRP_MN_MOUNT_VOLUME\n");
       status = DokanMountVolume(DeviceObject, Irp);
     } break;
 
     case IRP_MN_USER_FS_REQUEST:
-      DDbgPrint("	 IRP_MN_USER_FS_REQUEST\n");
+      DDbgPrint("     IRP_MN_USER_FS_REQUEST\n");
       status = DokanUserFsRequest(DeviceObject, &Irp);
       break;
 
     case IRP_MN_VERIFY_VOLUME:
-      DDbgPrint("	 IRP_MN_VERIFY_VOLUME\n");
+      DDbgPrint("     IRP_MN_VERIFY_VOLUME\n");
       break;
 
     default:

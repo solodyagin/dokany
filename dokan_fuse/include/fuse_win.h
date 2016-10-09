@@ -9,7 +9,9 @@
 #include <sys/types.h>
 
 #ifdef _MSC_VER
+#define WIN32_NO_STATUS
 #include <windows.h>
+#undef WIN32_NO_STATUS
 #endif
 
 /** Only use the latest version on Windows */
@@ -30,7 +32,6 @@ extern "C" {
 #endif
 int ntstatus_error_to_errno(int win_res);
 int errno_to_ntstatus_error(int err);
-NTSTATUS lasterror_to_ntstatus(DWORD last_err);
 
 //This stuff is useful only on Windows in MSVC
 #ifdef _MSC_VER
