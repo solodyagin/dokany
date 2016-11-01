@@ -546,8 +546,8 @@ Return Value:
           if (ret == 0 && (systemVolume.Length == fileObject->FileName.Length ||
                            *p2 == L'\\')) {
             DDbgPrint("  It's an access to System Volume, so don't return "
-                      "SUCCESS. We don't have one.") status =
-                STATUS_NO_SUCH_FILE;
+                      "SUCCESS. We don't have one.\n");
+            status = STATUS_NO_SUCH_FILE;
             __leave;
           }
         }
@@ -596,6 +596,7 @@ Return Value:
             if (relatedFileName == NULL) {
               DDbgPrint("    Can't allocatePool for relatedFileName\n");
               status = STATUS_INSUFFICIENT_RESOURCES;
+              DokanFCBUnlock(relatedFcb);
               __leave;
             }
             relatedFileName->Buffer =
@@ -605,6 +606,7 @@ Return Value:
               ExFreePool(relatedFileName);
               relatedFileName = NULL;
               status = STATUS_INSUFFICIENT_RESOURCES;
+              DokanFCBUnlock(relatedFcb);
               __leave;
             }
             relatedFileName->MaximumLength = relatedFcb->FileName.MaximumLength;
@@ -1034,10 +1036,13 @@ Return Value:
             !FlagOn(irpSp->Parameters.Create.Options,
                     FILE_COMPLETE_IF_OPLOCKED)) {
 
+          POPLOCK oplock = DokanGetFcbOplock(fcb);
+          DokanFCBUnlock(fcb);
           OplockBreakStatus = FsRtlOplockBreakH(
-              DokanGetFcbOplock(fcb), Irp, 0, eventContext,
+              oplock, Irp, 0, eventContext,
               NULL /* DokanOplockComplete */, // block instead of callback
               DokanPrePostIrp);
+          DokanFCBLockRW(fcb);
 
           //
           //  If FsRtlOplockBreakH returned STATUS_PENDING,
