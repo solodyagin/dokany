@@ -358,6 +358,8 @@ BOOL DOKANAPI DokanNetworkProviderUninstall() {
 
   if (wcsstr(buffer, commanp) != NULL) {
     WCHAR *dokan_pos = wcsstr(buffer, commanp);
+    if (dokan_pos == NULL)
+      return FALSE;
     wcsncpy_s(buffer2, sizeof(buffer2) / sizeof(WCHAR), buffer,
               dokan_pos - buffer);
     wcscat_s(buffer2, sizeof(buffer2) / sizeof(WCHAR),
@@ -574,9 +576,7 @@ BOOL DOKANAPI DokanRemoveMountPointEx(LPCWSTR MountPoint, BOOL Safe) {
           if (length + 1 < MAX_PATH) {
             mountPoint[length] = L'\\';
             mountPoint[length + 1] = L'\0';
-            // Required to remove reparse point (could also be done through
-            // FSCTL_DELETE_REPARSE_POINT with DeleteMountPoint function)
-            DeleteVolumeMountPoint(mountPoint);
+            DeleteMountPoint(mountPoint);
           }
         } else {
           // Notify applications / explorer

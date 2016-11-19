@@ -22,6 +22,10 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 #include "dokan.h"
 #include <wdmsec.h>
 
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, DokanOplockRequest)
+#endif
+
 NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
   NTSTATUS Status = STATUS_SUCCESS;
   ULONG FsControlCode;
@@ -183,13 +187,15 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
       //  REQUEST_OPLOCK_INPUT_FLAG_ACK on the input buffer.
       //
       DDbgPrint("    DokanOplockRequest STATUS_INVALID_PARAMETER\n");
-      return STATUS_INVALID_PARAMETER;
+      Status = STATUS_INVALID_PARAMETER;
+      __leave;
     } else {
 #else
     } else {
 #endif
       DDbgPrint("    DokanOplockRequest STATUS_INVALID_PARAMETER\n");
-      return STATUS_INVALID_PARAMETER;
+      Status = STATUS_INVALID_PARAMETER;
+      __leave;
     }
 
     //
@@ -207,7 +213,8 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
         DokanFCBFlagsIsSet(Fcb, DOKAN_DELETE_ON_CLOSE)) {
 
       DDbgPrint("    DokanOplockRequest STATUS_DELETE_PENDING\n");
-      return STATUS_DELETE_PENDING;
+      Status = STATUS_DELETE_PENDING;
+      __leave;
     }
 
     //

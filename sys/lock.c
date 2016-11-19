@@ -21,6 +21,10 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 
 #include "dokan.h"
 
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, DokanCommonLockControl)
+#endif
+
 NTSTATUS
 DokanCommonLockControl(__in PIRP Irp) {
   NTSTATUS Status = STATUS_SUCCESS;
@@ -55,7 +59,7 @@ DokanCommonLockControl(__in PIRP Irp) {
   //  as an invalid parameter
   //
   if (DokanFCBFlagsIsSet(Fcb, DOKAN_FILE_DIRECTORY)) {
-    DDbgPrint("  DokanCommonLockControl -> STATUS_INVALID_PARAMETER\n", 0);
+    DDbgPrint("  DokanCommonLockControl -> STATUS_INVALID_PARAMETER\n");
     return STATUS_INVALID_PARAMETER;
   }
 

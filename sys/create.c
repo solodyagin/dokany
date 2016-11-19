@@ -23,6 +23,7 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, DokanDispatchCreate)
+#pragma alloc_text(PAGE, DokanCheckShareAccess)
 #endif
 
 // We must NOT call without VCB lock
@@ -38,13 +39,20 @@ PDokanFCB DokanAllocateFCB(__in PDokanVCB Vcb, __in PWCHAR FileName,
 
   RtlZeroMemory(fcb, sizeof(DokanFCB));
 
+  fcb->AdvancedFCBHeader.Resource =
+      ExAllocateFromLookasideListEx(&g_DokanEResourceLookasideList);
+  if (fcb->AdvancedFCBHeader.Resource == NULL) {
+    ExFreeToLookasideListEx(&g_DokanFCBLookasideList, fcb);
+    return NULL;
+  }
+
   fcb->Identifier.Type = FCB;
   fcb->Identifier.Size = sizeof(DokanFCB);
 
   fcb->Vcb = Vcb;
 
-  ExInitializeResourceLite(&fcb->MainResource);
   ExInitializeResourceLite(&fcb->PagingIoResource);
+  ExInitializeResourceLite(fcb->AdvancedFCBHeader.Resource);
 
   ExInitializeFastMutex(&fcb->AdvancedFCBHeaderMutex);
 
@@ -61,7 +69,6 @@ PDokanFCB DokanAllocateFCB(__in PDokanVCB Vcb, __in PWCHAR FileName,
   fcb->AdvancedFCBHeader.ValidDataLength.LowPart = 0xffffffff;
   fcb->AdvancedFCBHeader.ValidDataLength.HighPart = 0x7fffffff;
 
-  fcb->AdvancedFCBHeader.Resource = &fcb->MainResource;
   fcb->AdvancedFCBHeader.PagingIoResource = &fcb->PagingIoResource;
 
   fcb->AdvancedFCBHeader.AllocationSize.QuadPart = 4096;
@@ -69,8 +76,6 @@ PDokanFCB DokanAllocateFCB(__in PDokanVCB Vcb, __in PWCHAR FileName,
 
   fcb->AdvancedFCBHeader.IsFastIoPossible = FastIoIsNotPossible;
   FsRtlInitializeOplock(DokanGetFcbOplock(fcb));
-
-  ExInitializeResourceLite(&fcb->Resource);
 
   fcb->FileName.Buffer = FileName;
   fcb->FileName.Length = (USHORT)FileNameLength;
@@ -193,13 +198,13 @@ DokanFreeFCB(__in PDokanFCB Fcb) {
 #endif
 
     DokanFCBUnlock(Fcb);
-    ExDeleteResourceLite(&Fcb->Resource);
-    ExDeleteResourceLite(&Fcb->MainResource);
+    ExDeleteResourceLite(Fcb->AdvancedFCBHeader.Resource);
+    ExFreeToLookasideListEx(&g_DokanEResourceLookasideList,
+                            Fcb->AdvancedFCBHeader.Resource);
     ExDeleteResourceLite(&Fcb->PagingIoResource);
 
     InterlockedIncrement(&vcb->FcbFreed);
     ExFreeToLookasideListEx(&g_DokanFCBLookasideList, Fcb);
-
   } else {
     DokanFCBUnlock(Fcb);
   }
@@ -322,7 +327,8 @@ NTSTATUS DokanGetParentDir(__in const WCHAR *fileName, __out WCHAR **parentDir,
   if (!*parentDir)
     return STATUS_INSUFFICIENT_RESOURCES;
 
-  wcscpy(*parentDir, fileName);
+  RtlZeroMemory(*parentDir, len + 1);
+  RtlStringCchCopyW(*parentDir, len, fileName);
 
   for (i = len - 1; i >= 0; i--) {
     if ((*parentDir)[i] == '\\') {
@@ -690,7 +696,6 @@ Return Value:
       RtlCopyMemory((PCHAR)fileName + relatedFileName->Length +
                         (needBackSlashAfterRelatedFile ? sizeof(WCHAR) : 0),
                     fileObject->FileName.Buffer, fileObject->FileName.Length);
-
     } else {
       // if related file object is not specifed, copy the file name of file
       // object
@@ -1107,7 +1112,6 @@ Return Value:
           // user mode create happens.
           // It is believed that FILE_COMPLETE_IF_OPLOCKED is extremely
           // rare and may never happend during normal operation.
-
         } else {
 
           if (status == STATUS_SHARING_VIOLATION &&
@@ -1126,7 +1130,6 @@ Return Value:
 #endif
       }
       IoUpdateShareAccess(fileObject, &fcb->ShareAccess);
-
     } else {
       IoSetShareAccess(
           eventContext->Operation.Create.SecurityContext.DesiredAccess,
@@ -1213,7 +1216,6 @@ Return Value:
     status = DokanRegisterPendingIrp(DeviceObject, Irp, eventContext, 0);
 
     EventContextConsumed = TRUE;
-
   } __finally {
 
     DDbgPrint("  Create: FileName:%wZ, status = 0x%08x\n",

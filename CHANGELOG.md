@@ -3,15 +3,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](http://keepachangelog.com/) and this project adheres to [Semantic Versioning](http://semver.org/).
 
-## [Unreleased] - 1.0.1.0000
+## [Unreleased] - 1.0.2.1000
+
+## [1.0.1.1000] - 2016-11-04
+### Added
+- Library - `DokanMapStandardToGenericAccess` - Convert `IRP_MJ_CREATE` DesiredAccess to generic rights.
 
 ### Changed
 - Driver - Use atomic operations for FCB and CCB flags instead of locks.
 - Update Windows SDK to 10.0.14393
-- Library - Call now DeleteFile and DeleteDirectory with DeleteOnClose set at a delete request OR canceled.
+- Library - Call now `DeleteFile` and `DeleteDirectory` with `DeleteOnClose` set at a delete request OR canceled.
+- Driver -  Double check that the returned security descriptor is valid before returning success on QuerySecurity.
+- Installer - Enable dev tools by default.
+- Driver - Return `STATUS_FILE_LOCKED_WITH_ONLY_READERS` during `PreAcquireForSectionSynchronization` when locked only with readers.
+- Mirror - Open handle when `GetFileInformation` requested after cleanup.
+- Kernel - Remove FCB `Resource` and `MainResource`. Use FCB Header `Resource` instead allocated with LookasideList.
 
 ### Fixed
-- Driver - `CcPurgeCacheSection` could cause deadlock when fcb was locked in the same time.
+- Driver - `CcPurgeCacheSection` could cause deadlock when FCB was locked in the same time.
+- Driver - Deadlock on related FCB.
+- FUSE - Race condition in Dokan FUSE.
+- Driver - BSOD issue related to filesystem mount on Windows 10 build 14936.
+- Driver - Unlock FCB during `FsRtlOplockBreakH` to let other request Lock FCB.
+- FUSE - Set correctly Authenticated Users rights (Explorer menu context).
+- Mirror - Reject when trying to open a file as a directory.
+- Driver - Return correct status for `FSCTL_FILESYSTEM_GET_STATISTICS` - Can now net share on Windows Server 2012 R2
 
 ## [1.0.0.5000] - 2016-09-20
 ### Added
@@ -198,7 +214,8 @@ Latest Dokan version from Hiroki Asakawa.
  [http://dokan-dev.net/en]( http://web.archive.org/web/20150419082954/http://dokan-dev.net/en/)
 
 
-[Unreleased]: https://github.com/dokan-dev/dokany/compare/v1.0.0...master
+[Unreleased]: https://github.com/dokan-dev/dokany/compare/v1.0.1...master
+[1.0.1.1000]: https://github.com/dokan-dev/dokany/compare/v1.0.0...v1.0.1
 [1.0.0.5000]: https://github.com/dokan-dev/dokany/compare/v0.8.0...v1.0.0
 [0.8.0]: https://github.com/dokan-dev/dokany/compare/v0.7.4...v0.8.0
 [0.7.4]: https://github.com/dokan-dev/dokany/compare/0.7.2...v0.7.4

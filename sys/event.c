@@ -21,7 +21,12 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 
 #include "dokan.h"
 
-VOID DokanIrpCancelRoutine(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
+#ifdef ALLOC_PRAGMA
+#pragma alloc_text(PAGE, DokanOplockComplete)
+#endif
+
+VOID DokanIrpCancelRoutine(_Inout_ PDEVICE_OBJECT DeviceObject,
+                           _Inout_ _IRQL_uses_cancel_ PIRP Irp) {
   KIRQL oldIrql;
   PIRP_ENTRY irpEntry;
   ULONG serialNumber = 0;
@@ -257,7 +262,7 @@ DokanRegisterPendingIrp(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp,
 
 NTSTATUS
 DokanRegisterPendingIrpForEvent(__in PDEVICE_OBJECT DeviceObject,
-                                __in PIRP Irp) {
+                                _Inout_ PIRP Irp) {
   PDokanVCB vcb = DeviceObject->DeviceExtension;
 
   if (GetIdentifierType(vcb) != VCB) {
@@ -282,7 +287,7 @@ DokanRegisterPendingIrpForEvent(__in PDEVICE_OBJECT DeviceObject,
 
 NTSTATUS
 DokanRegisterPendingIrpForService(__in PDEVICE_OBJECT DeviceObject,
-                                  __in PIRP Irp) {
+                                  _Inout_ PIRP Irp) {
   PDOKAN_GLOBAL dokanGlobal;
   DDbgPrint("DokanRegisterPendingIrpForService\n");
 
@@ -301,7 +306,7 @@ DokanRegisterPendingIrpForService(__in PDEVICE_OBJECT DeviceObject,
 // When user-mode file system application returns EventInformation,
 // search corresponding pending IRP and complete it
 NTSTATUS
-DokanCompleteIrp(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
+DokanCompleteIrp(__in PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp) {
   KIRQL oldIrql;
   PLIST_ENTRY thisEntry, nextEntry, listHead;
   PIRP_ENTRY irpEntry;
@@ -449,18 +454,18 @@ DokanCompleteIrp(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
 
 // start event dispatching
 NTSTATUS
-DokanEventStart(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
+DokanEventStart(__in PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp) {
   ULONG outBufferLen;
   ULONG inBufferLen;
-  PIO_STACK_LOCATION irpSp;
-  EVENT_START eventStart;
-  PEVENT_DRIVER_INFO driverInfo;
-  PDOKAN_GLOBAL dokanGlobal;
-  PDokanDCB dcb;
+  PIO_STACK_LOCATION irpSp = NULL;
+  PEVENT_START eventStart = NULL;
+  PEVENT_DRIVER_INFO driverInfo = NULL;
+  PDOKAN_GLOBAL dokanGlobal = NULL;
+  PDokanDCB dcb = NULL;
   NTSTATUS status;
   DEVICE_TYPE deviceType;
   ULONG deviceCharacteristics = 0;
-  WCHAR baseGuidString[64];
+  WCHAR *baseGuidString;
   GUID baseGuid = DOKAN_BASE_GUID;
   UNICODE_STRING unicodeGuid;
   ULONG deviceNamePos;
@@ -480,24 +485,34 @@ DokanEventStart(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
   outBufferLen = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
   inBufferLen = irpSp->Parameters.DeviceIoControl.InputBufferLength;
 
+  eventStart = ExAllocatePool(sizeof(EVENT_START));
+  baseGuidString = ExAllocatePool(64 * sizeof(WCHAR));
+
   if (outBufferLen != sizeof(EVENT_DRIVER_INFO) ||
-      inBufferLen != sizeof(EVENT_START)) {
+      inBufferLen != sizeof(EVENT_START) || eventStart == NULL ||
+      baseGuidString == NULL) {
+    if (eventStart)
+      ExFreePool(eventStart);
+    if (baseGuidString)
+      ExFreePool(baseGuidString);
     return STATUS_INSUFFICIENT_RESOURCES;
   }
 
-  RtlCopyMemory(&eventStart, Irp->AssociatedIrp.SystemBuffer,
+  RtlCopyMemory(eventStart, Irp->AssociatedIrp.SystemBuffer,
                 sizeof(EVENT_START));
   driverInfo = Irp->AssociatedIrp.SystemBuffer;
 
-  if (eventStart.UserVersion != DOKAN_DRIVER_VERSION) {
+  if (eventStart->UserVersion != DOKAN_DRIVER_VERSION) {
     driverInfo->DriverVersion = DOKAN_DRIVER_VERSION;
     driverInfo->Status = DOKAN_START_FAILED;
     Irp->IoStatus.Status = STATUS_SUCCESS;
     Irp->IoStatus.Information = sizeof(EVENT_DRIVER_INFO);
+    ExFreePool(eventStart);
+    ExFreePool(baseGuidString);
     return STATUS_SUCCESS;
   }
 
-  switch (eventStart.DeviceType) {
+  switch (eventStart->DeviceType) {
   case DOKAN_DISK_FILE_SYSTEM:
     deviceType = FILE_DEVICE_DISK_FILE_SYSTEM;
     break;
@@ -506,31 +521,31 @@ DokanEventStart(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
     deviceCharacteristics |= FILE_REMOTE_DEVICE;
     break;
   default:
-    DDbgPrint("  Unknown device type: %d\n", eventStart.DeviceType);
+    DDbgPrint("  Unknown device type: %d\n", eventStart->DeviceType);
     deviceType = FILE_DEVICE_DISK_FILE_SYSTEM;
   }
 
-  if (eventStart.Flags & DOKAN_EVENT_REMOVABLE) {
+  if (eventStart->Flags & DOKAN_EVENT_REMOVABLE) {
     DDbgPrint("  DeviceCharacteristics |= FILE_REMOVABLE_MEDIA\n");
     deviceCharacteristics |= FILE_REMOVABLE_MEDIA;
   }
 
-  if (eventStart.Flags & DOKAN_EVENT_WRITE_PROTECT) {
+  if (eventStart->Flags & DOKAN_EVENT_WRITE_PROTECT) {
     DDbgPrint("  DeviceCharacteristics |= FILE_READ_ONLY_DEVICE\n");
     deviceCharacteristics |= FILE_READ_ONLY_DEVICE;
   }
 
-  if (eventStart.Flags & DOKAN_EVENT_MOUNT_MANAGER) {
+  if (eventStart->Flags & DOKAN_EVENT_MOUNT_MANAGER) {
     DDbgPrint("  Using Mount Manager\n");
     useMountManager = TRUE;
   }
 
-  if (eventStart.Flags & DOKAN_EVENT_CURRENT_SESSION) {
+  if (eventStart->Flags & DOKAN_EVENT_CURRENT_SESSION) {
     DDbgPrint("  Mounting on current session only\n");
     mountGlobally = FALSE;
   }
 
-  if (eventStart.Flags & DOKAN_EVENT_FILELOCK_USER_MODE) {
+  if (eventStart->Flags & DOKAN_EVENT_FILELOCK_USER_MODE) {
     DDbgPrint("  FileLock in User Mode\n");
     fileLockUserMode = TRUE;
   }
@@ -542,13 +557,13 @@ DokanEventStart(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
   RtlZeroMemory(&dokanControl, sizeof(dokanControl));
   RtlStringCchCopyW(dokanControl.MountPoint, MAXIMUM_FILENAME_LENGTH,
                     L"\\DosDevices\\");
-  if (wcslen(eventStart.MountPoint) == 1) {
-    dokanControl.MountPoint[12] = towupper(eventStart.MountPoint[0]);
+  if (wcslen(eventStart->MountPoint) == 1) {
+    dokanControl.MountPoint[12] = towupper(eventStart->MountPoint[0]);
     dokanControl.MountPoint[13] = L':';
     dokanControl.MountPoint[14] = L'\0';
   } else {
     RtlStringCchCatW(dokanControl.MountPoint, MAXIMUM_FILENAME_LENGTH,
-                     eventStart.MountPoint);
+                     eventStart->MountPoint);
   }
 
   DDbgPrint("  Checking for MountPoint %ls \n", dokanControl.MountPoint);
@@ -561,6 +576,8 @@ DokanEventStart(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
     Irp->IoStatus.Information = sizeof(EVENT_DRIVER_INFO);
     ExReleaseResourceLite(&dokanGlobal->Resource);
     KeLeaveCriticalRegion();
+    ExFreePool(eventStart);
+    ExFreePool(baseGuidString);
     return STATUS_SUCCESS;
   }
 
@@ -571,23 +588,27 @@ DokanEventStart(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
   if (!NT_SUCCESS(status)) {
     ExReleaseResourceLite(&dokanGlobal->Resource);
     KeLeaveCriticalRegion();
+    ExFreePool(eventStart);
+    ExFreePool(baseGuidString);
     return status;
   }
-  RtlZeroMemory(baseGuidString, sizeof(baseGuidString));
-  RtlStringCchCopyW(baseGuidString, sizeof(baseGuidString) / sizeof(WCHAR),
+  RtlZeroMemory(baseGuidString, 64 * sizeof(WCHAR));
+  RtlStringCchCopyW(baseGuidString, 64,
                     unicodeGuid.Buffer);
   RtlFreeUnicodeString(&unicodeGuid);
 
   InterlockedIncrement((LONG *)&dokanGlobal->MountId);
 
   status = DokanCreateDiskDevice(
-      DeviceObject->DriverObject, dokanGlobal->MountId, eventStart.MountPoint,
-      eventStart.UNCName, baseGuidString, dokanGlobal, deviceType,
+      DeviceObject->DriverObject, dokanGlobal->MountId, eventStart->MountPoint,
+      eventStart->UNCName, baseGuidString, dokanGlobal, deviceType,
       deviceCharacteristics, mountGlobally, useMountManager, &dcb);
 
   if (!NT_SUCCESS(status)) {
     ExReleaseResourceLite(&dokanGlobal->Resource);
     KeLeaveCriticalRegion();
+    ExFreePool(eventStart);
+    ExFreePool(baseGuidString);
     return status;
   }
 
@@ -613,21 +634,21 @@ DokanEventStart(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
   // Set the irp timeout in milliseconds
   // If the IrpTimeout is 0, we assume that the value was not changed
   dcb->IrpTimeout = DOKAN_IRP_PENDING_TIMEOUT;
-  if (eventStart.IrpTimeout > 0) {
-    if (eventStart.IrpTimeout > DOKAN_IRP_PENDING_TIMEOUT_RESET_MAX) {
-      eventStart.IrpTimeout = DOKAN_IRP_PENDING_TIMEOUT_RESET_MAX;
+  if (eventStart->IrpTimeout > 0) {
+    if (eventStart->IrpTimeout > DOKAN_IRP_PENDING_TIMEOUT_RESET_MAX) {
+      eventStart->IrpTimeout = DOKAN_IRP_PENDING_TIMEOUT_RESET_MAX;
     }
 
-    if (eventStart.IrpTimeout < DOKAN_IRP_PENDING_TIMEOUT) {
-      eventStart.IrpTimeout = DOKAN_IRP_PENDING_TIMEOUT;
+    if (eventStart->IrpTimeout < DOKAN_IRP_PENDING_TIMEOUT) {
+      eventStart->IrpTimeout = DOKAN_IRP_PENDING_TIMEOUT;
     }
-    dcb->IrpTimeout = eventStart.IrpTimeout;
+    dcb->IrpTimeout = eventStart->IrpTimeout;
   }
 
   DDbgPrint("  DeviceName:%ws\n", driverInfo->DeviceName);
 
   dcb->UseAltStream = 0;
-  if (eventStart.Flags & DOKAN_EVENT_ALTERNATIVE_STREAM_ON) {
+  if (eventStart->Flags & DOKAN_EVENT_ALTERNATIVE_STREAM_ON) {
     DDbgPrint("  ALT_STREAM_ON\n");
     dcb->UseAltStream = 1;
   }
@@ -642,6 +663,9 @@ DokanEventStart(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
   Irp->IoStatus.Status = STATUS_SUCCESS;
   Irp->IoStatus.Information = sizeof(EVENT_DRIVER_INFO);
 
+  ExFreePool(eventStart);
+  ExFreePool(baseGuidString);
+
   DDbgPrint("<== DokanEventStart\n");
 
   return Irp->IoStatus.Status;
@@ -649,7 +673,7 @@ DokanEventStart(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
 
 // user assinged bigger buffer that is enough to return WriteEventContext
 NTSTATUS
-DokanEventWrite(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
+DokanEventWrite(__in PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp) {
   KIRQL oldIrql;
   PLIST_ENTRY thisEntry, nextEntry, listHead;
   PIRP_ENTRY irpEntry;

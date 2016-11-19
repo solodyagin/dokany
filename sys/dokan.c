@@ -29,6 +29,7 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 ULONG g_Debug = DOKAN_DEBUG_DEFAULT;
 LOOKASIDE_LIST_EX g_DokanCCBLookasideList;
 LOOKASIDE_LIST_EX g_DokanFCBLookasideList;
+LOOKASIDE_LIST_EX g_DokanEResourceLookasideList;
 
 #if _WIN32_WINNT < 0x0501
 PFN_FSRTLTEARDOWNPERSTREAMCONTEXTS DokanFsRtlTeardownPerStreamContexts;
@@ -110,14 +111,18 @@ DokanFilterCallbackAcquireForCreateSection(__in PFS_FILTER_CALLBACK_DATA
                                                CallbackData,
                                            __out PVOID *CompletionContext) {
   PFSRTL_ADVANCED_FCB_HEADER header;
-  PDokanFCB fcb;
+  PDokanFCB fcb = NULL;
+  PDokanCCB ccb;
 
   UNREFERENCED_PARAMETER(CompletionContext);
 
   DDbgPrint("DokanFilterCallbackAcquireForCreateSection\n");
 
   header = CallbackData->FileObject->FsContext;
-  fcb = CallbackData->FileObject->FsContext2;
+  ccb = CallbackData->FileObject->FsContext2;
+
+  if (ccb)
+    fcb = ccb->Fcb;
 
   if (header && header->Resource) {
     KeEnterCriticalRegion();
@@ -295,6 +300,16 @@ Return Value:
     return STATUS_INSUFFICIENT_RESOURCES;
   }
 
+  if (!DokanLookasideCreate(&g_DokanEResourceLookasideList,
+                            sizeof(ERESOURCE))) {
+    IoDeleteDevice(dokanGlobal->FsDiskDeviceObject);
+    IoDeleteDevice(dokanGlobal->FsCdDeviceObject);
+    IoDeleteDevice(dokanGlobal->DeviceObject);
+    ExDeleteLookasideListEx(&g_DokanCCBLookasideList);
+    ExDeleteLookasideListEx(&g_DokanFCBLookasideList);
+    return STATUS_INSUFFICIENT_RESOURCES;
+  }
+
   DDbgPrint("<== DriverEntry\n");
 
   return (status);
@@ -324,8 +339,9 @@ Return Value:
   UNICODE_STRING symbolicLinkName;
   PDOKAN_GLOBAL dokanGlobal;
 
-  // PAGED_CODE();
   DDbgPrint("==> DokanUnload\n");
+
+  PAGED_CODE();
 
   dokanGlobal = deviceObject->DeviceExtension;
   if (GetIdentifierType(dokanGlobal) == DGL) {
@@ -347,6 +363,7 @@ Return Value:
 
   ExDeleteLookasideListEx(&g_DokanCCBLookasideList);
   ExDeleteLookasideListEx(&g_DokanFCBLookasideList);
+  ExDeleteLookasideListEx(&g_DokanEResourceLookasideList);
 
   DDbgPrint("<== DokanUnload\n");
   return;
