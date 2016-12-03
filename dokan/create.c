@@ -332,5 +332,7 @@ VOID DispatchCreate(HANDLE Handle, // This handle is not for a file. It is for
 
   SendEventInformation(Handle, &eventInfo, sizeof(EVENT_INFORMATION),
                        DokanInstance);
-  return;
+
+  if (eventInfo.Status != STATUS_SUCCESS)
+    free((PDOKAN_OPEN_INFO)(UINT_PTR)eventInfo.Context);
 }
