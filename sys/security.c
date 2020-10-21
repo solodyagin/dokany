@@ -1,7 +1,8 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2020 Google, Inc.
+  Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
   http://dokan-dev.github.io
@@ -333,7 +334,9 @@ VOID DokanCompleteSetSecurity(__in PIRP_ENTRY IrpEntry,
   PIRP irp;
   PIO_STACK_LOCATION irpSp;
   PFILE_OBJECT fileObject;
-  PDokanCCB ccb;
+  PDokanCCB ccb = NULL;
+  PDokanFCB fcb = NULL;
+
 
   DDbgPrint("==> DokanCompleteSetSecurity\n");
 
@@ -346,8 +349,17 @@ VOID DokanCompleteSetSecurity(__in PIRP_ENTRY IrpEntry,
   ccb = fileObject->FsContext2;
   if (ccb != NULL) {
     ccb->UserContext = EventInfo->Context;
+    fcb = ccb->Fcb;
+    ASSERT(fcb != NULL);
   } else {
     DDbgPrint("  ccb == NULL\n");
+  }
+
+  if (fcb && NT_SUCCESS(EventInfo->Status)) {
+    DokanFCBLockRO(fcb);
+    DokanNotifyReportChange(fcb, FILE_NOTIFY_CHANGE_SECURITY,
+                            FILE_ACTION_MODIFIED);
+    DokanFCBUnlock(fcb);
   }
 
   DokanCompleteIrpRequest(irp, EventInfo->Status, 0);

@@ -27,6 +27,8 @@ private:
 public:
 	impl_file_locks() { InitializeCriticalSection(&lock); }
 	~impl_file_locks() { DeleteCriticalSection(&lock); };
+	impl_file_locks(impl_file_locks &other) = delete;
+	impl_file_locks &operator=(const impl_file_locks &other) = delete;
 	int get_file(const std::string &name, bool is_dir, DWORD access_mode, DWORD shared_mode, std::unique_ptr<impl_file_handle>& out);
 	void renamed_file(const std::string &name,const std::string &new_name);
 	void remove_file(const std::string& name);
@@ -50,6 +52,8 @@ class impl_chain_guard
 public:
 	impl_chain_guard(impl_fuse_context* ctx, int caller_pid);
 	~impl_chain_guard();
+	impl_chain_guard(impl_chain_guard &other) = delete;
+	impl_chain_guard &operator=(const impl_chain_guard &other) = delete;
 };
 
 class win_error
@@ -57,9 +61,9 @@ class win_error
 public:
 	win_error(int _err): err(errno_to_ntstatus_error(_err)) {}
 	win_error(int _err, bool): err(_err) {}
-	operator int() const { return err; }
+	operator long() const { return err; }
 private:
-	int err;
+	long err;
 };
 /*
 	FUSE filesystem context
@@ -75,13 +79,13 @@ class impl_fuse_context
 
 	unsigned int filemask_;
 	unsigned int dirmask_;
-	const char *fsname_, *volname_;
+	const char *fsname_, *volname_, *uncname_;
 
 	impl_file_locks file_locks;
 public:
 	impl_fuse_context(const struct fuse_operations *ops, void *user_data, 
 		bool debug, unsigned int filemask, unsigned int dirmask,
-		const char *fsname, const char *volname);
+		const char *fsname, const char *volname, const char *uncname);
 
 	bool debug() const {return debug_;}
 
@@ -104,20 +108,31 @@ public:
 	int resolve_symlink(const std::string &name, std::string *res);
 	int check_and_resolve(std::string *name);
 
+    typedef int(*PWalkDirectoryWithSetFuseContext)(PDOKAN_FILE_INFO DokanFileInfo, void *buf, const char *name,
+        const struct FUSE_STAT *stbuf,
+        FUSE_OFF_T off);
+
 	struct walk_data
 	{
-		impl_fuse_context *ctx;
+		impl_fuse_context *ctx = nullptr;
 		std::string dirname;
-		PDOKAN_FILE_INFO DokanFileInfo;
-		PFillFindData delegate;
+		PDOKAN_FILE_INFO DokanFileInfo = nullptr;
+		PFillFindData delegate = nullptr;
+		PWalkDirectoryWithSetFuseContext delegateSetFuseContext = nullptr;
 		std::vector<std::string> getdir_data; //Used only in walk_directory_getdir()
 	};
 	static int walk_directory(void *buf, const char *name,
 		const struct FUSE_STAT *stbuf, FUSE_OFF_T off);
 	static int walk_directory_getdir(fuse_dirh_t hndl, const char *name, int type,ino_t ino);
 
+	static int readdir_filler_set_has_files(void *buf, const char *name,
+		const struct FUSE_STAT *stbuf, FUSE_OFF_T off);
+	static int getdir_filler_set_has_files(fuse_dirh_t hndl, const char *name,
+		int type, ino_t ino);
+
 	///////////////////////////////////Delegates//////////////////////////////
 	int find_files(LPCWSTR file_name, PFillFindData fill_find_data,
+        PWalkDirectoryWithSetFuseContext walk_set_fuse_context,
 		PDOKAN_FILE_INFO dokan_file_info);
 
 	int open_directory(LPCWSTR file_name, PDOKAN_FILE_INFO dokan_file_info);
@@ -129,7 +144,7 @@ public:
 	int delete_directory(LPCWSTR file_name, PDOKAN_FILE_INFO dokan_file_info);
 
 	win_error create_file(LPCWSTR file_name, DWORD access_mode, DWORD share_mode,
-		DWORD creation_disposition, DWORD flags_and_attributes,
+		DWORD creation_disposition, DWORD flags_and_attributes, ULONG CreateOptions,
 		PDOKAN_FILE_INFO dokan_file_info);
 
 	int close_file(LPCWSTR file_name, PDOKAN_FILE_INFO dokan_file_info);
@@ -201,6 +216,8 @@ class impl_file_lock
 public:
 	impl_file_lock(impl_file_locks* _locks, const std::string& name): name_(name), locks(_locks), first(nullptr) { InitializeCriticalSection(&lock); }
 	~impl_file_lock() { DeleteCriticalSection(&lock); };
+	impl_file_lock(impl_file_lock &other) = delete;
+	impl_file_lock &operator=(const impl_file_lock &other) = delete;
 	void remove_file(impl_file_handle *file);
 	const std::string& get_name() const {return name_;}
 };
@@ -220,6 +237,8 @@ class impl_file_handle
 	impl_file_handle(bool is_dir, DWORD shared_mode);
 public:
 	~impl_file_handle();
+	impl_file_handle(impl_file_handle &other) = delete;
+	impl_file_handle &operator=(const impl_file_handle &other) = delete;
 
 	bool is_dir() const {return is_dir_;}
 	int close(const struct fuse_operations *ops);

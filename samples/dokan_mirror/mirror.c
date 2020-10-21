@@ -1,7 +1,8 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2020 Google, Inc.
+  Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
   http://dokan-dev.github.io
@@ -32,9 +33,19 @@ THE SOFTWARE.
 #include <stdlib.h>
 #include <winbase.h>
 
+//#define WIN10_ENABLE_LONG_PATH
+#ifdef WIN10_ENABLE_LONG_PATH
+//dirty but should be enough
+#define DOKAN_MAX_PATH 32768
+#else
+#define DOKAN_MAX_PATH MAX_PATH
+#endif // DEBUG
+
 BOOL g_UseStdErr;
 BOOL g_DebugMode;
+BOOL g_CaseSensitive;
 BOOL g_HasSeSecurityPrivilege;
+BOOL g_ImpersonateCallerUser;
 
 static void DbgPrint(LPCWSTR format, ...) {
   if (g_DebugMode) {
@@ -64,9 +75,9 @@ static void DbgPrint(LPCWSTR format, ...) {
   }
 }
 
-static WCHAR RootDirectory[MAX_PATH] = L"C:";
-static WCHAR MountPoint[MAX_PATH] = L"M:\\";
-static WCHAR UNCName[MAX_PATH] = L"";
+static WCHAR RootDirectory[DOKAN_MAX_PATH] = L"C:";
+static WCHAR MountPoint[DOKAN_MAX_PATH] = L"M:\\";
+static WCHAR UNCName[DOKAN_MAX_PATH] = L"";
 
 static void GetFilePath(PWCHAR filePath, ULONG numberOfElements,
                         LPCWSTR FileName) {
@@ -92,6 +103,9 @@ static void PrintUserName(PDOKAN_FILE_INFO DokanFileInfo) {
   DWORD domainLength = sizeof(domainName) / sizeof(WCHAR);
   PTOKEN_USER tokenUser;
   SID_NAME_USE snu;
+
+  if (!g_DebugMode)
+    return;
 
   handle = DokanOpenRequestorToken(DokanFileInfo);
   if (handle == INVALID_HANDLE_VALUE) {
@@ -121,7 +135,7 @@ static void PrintUserName(PDOKAN_FILE_INFO DokanFileInfo) {
 static BOOL AddSeSecurityNamePrivilege() {
   HANDLE token = 0;
   DbgPrint(
-      L"## Attempting to add SE_SECURITY_NAME privilege to process token ##\n");
+           L"## Attempting to add SE_SECURITY_NAME privilege to process token ##\n");
   DWORD err;
   LUID luid;
   if (!LookupPrivilegeValue(0, SE_SECURITY_NAME, &luid)) {
@@ -170,7 +184,7 @@ static BOOL AddSeSecurityNamePrivilege() {
     }
   }
   DbgPrint(privAlreadyPresent ? L"  success: privilege already present\n"
-                              : L"  success: privilege added\n");
+             : L"  success: privilege added\n");
   if (token)
     CloseHandle(token);
   return TRUE;
@@ -186,7 +200,7 @@ MirrorCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
                  ACCESS_MASK DesiredAccess, ULONG FileAttributes,
                  ULONG ShareAccess, ULONG CreateDisposition,
                  ULONG CreateOptions, PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  WCHAR filePath[DOKAN_MAX_PATH];
   HANDLE handle;
   DWORD fileAttr;
   NTSTATUS status = STATUS_SUCCESS;
@@ -195,19 +209,19 @@ MirrorCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
   DWORD error = 0;
   SECURITY_ATTRIBUTES securityAttrib;
   ACCESS_MASK genericDesiredAccess;
+  // userTokenHandle is for Impersonate Caller User Option
+  HANDLE userTokenHandle = INVALID_HANDLE_VALUE;
 
   securityAttrib.nLength = sizeof(securityAttrib);
   securityAttrib.lpSecurityDescriptor =
-      SecurityContext->AccessState.SecurityDescriptor;
+    SecurityContext->AccessState.SecurityDescriptor;
   securityAttrib.bInheritHandle = FALSE;
 
   DokanMapKernelToUserCreateFileFlags(
-      FileAttributes, CreateOptions, CreateDisposition, &fileAttributesAndFlags,
-      &creationDisposition);
+      DesiredAccess, FileAttributes, CreateOptions, CreateDisposition,
+	  &genericDesiredAccess, &fileAttributesAndFlags, &creationDisposition);
 
-  genericDesiredAccess = DokanMapStandardToGenericAccess(DesiredAccess);
-
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"CreateFile : %s\n", filePath);
 
@@ -253,27 +267,38 @@ MirrorCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
   // be opened.
   fileAttr = GetFileAttributes(filePath);
 
-  if (fileAttr != INVALID_FILE_ATTRIBUTES &&
-      (fileAttr & FILE_ATTRIBUTE_DIRECTORY) &&
-      !(CreateOptions & FILE_NON_DIRECTORY_FILE)) {
-    DokanFileInfo->IsDirectory = TRUE;
-    if (DesiredAccess & DELETE) {
-      // Needed by FindFirstFile to see if directory is empty or not
-      ShareAccess |= FILE_SHARE_READ;
-    }
+  if (fileAttr != INVALID_FILE_ATTRIBUTES
+    && fileAttr & FILE_ATTRIBUTE_DIRECTORY) {
+      if (!(CreateOptions & FILE_NON_DIRECTORY_FILE)) {
+        DokanFileInfo->IsDirectory = TRUE;
+        // Needed by FindFirstFile to list files in it
+        // TODO: use ReOpenFile in MirrorFindFiles to set share read temporary
+        ShareAccess |= FILE_SHARE_READ;
+      } else { // FILE_NON_DIRECTORY_FILE - Cannot open a dir as a file
+        DbgPrint(L"\tCannot open a dir as a file\n");
+        return STATUS_FILE_IS_A_DIRECTORY;
+      }
   }
 
   DbgPrint(L"\tFlagsAndAttributes = 0x%x\n", fileAttributesAndFlags);
 
   MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_ARCHIVE);
+  MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_COMPRESSED);
+  MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_DEVICE);
+  MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_DIRECTORY);
   MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_ENCRYPTED);
   MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_HIDDEN);
+  MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_INTEGRITY_STREAM);
   MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_NORMAL);
   MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED);
+  MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_NO_SCRUB_DATA);
   MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_OFFLINE);
   MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_READONLY);
+  MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_REPARSE_POINT);
+  MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_SPARSE_FILE);
   MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_SYSTEM);
   MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_TEMPORARY);
+  MirrorCheckFlag(fileAttributesAndFlags, FILE_ATTRIBUTE_VIRTUAL);
   MirrorCheckFlag(fileAttributesAndFlags, FILE_FLAG_WRITE_THROUGH);
   MirrorCheckFlag(fileAttributesAndFlags, FILE_FLAG_OVERLAPPED);
   MirrorCheckFlag(fileAttributesAndFlags, FILE_FLAG_NO_BUFFERING);
@@ -292,6 +317,9 @@ MirrorCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
   MirrorCheckFlag(fileAttributesAndFlags, SECURITY_EFFECTIVE_ONLY);
   MirrorCheckFlag(fileAttributesAndFlags, SECURITY_SQOS_PRESENT);
 
+  if (g_CaseSensitive)
+    fileAttributesAndFlags |= FILE_FLAG_POSIX_SEMANTICS;
+
   if (creationDisposition == CREATE_NEW) {
     DbgPrint(L"\tCREATE_NEW\n");
   } else if (creationDisposition == OPEN_ALWAYS) {
@@ -306,27 +334,52 @@ MirrorCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
     DbgPrint(L"\tUNKNOWN creationDisposition!\n");
   }
 
+  if (g_ImpersonateCallerUser) {
+    userTokenHandle = DokanOpenRequestorToken(DokanFileInfo);
+
+    if (userTokenHandle == INVALID_HANDLE_VALUE) {
+      DbgPrint(L"  DokanOpenRequestorToken failed\n");
+      // Should we return some error?
+    }
+  }
+
   if (DokanFileInfo->IsDirectory) {
     // It is a create directory request
-    if (creationDisposition == CREATE_NEW) {
-      if (!CreateDirectory(filePath, &securityAttrib)) {
-        error = GetLastError();
-        DbgPrint(L"\terror code = %d\n\n", error);
-        status = DokanNtStatusFromWin32(error);
+
+    if (creationDisposition == CREATE_NEW ||
+        creationDisposition == OPEN_ALWAYS) {
+
+      if (g_ImpersonateCallerUser && userTokenHandle != INVALID_HANDLE_VALUE) {
+        // if g_ImpersonateCallerUser option is on, call the ImpersonateLoggedOnUser function.
+        if (!ImpersonateLoggedOnUser(userTokenHandle)) {
+          // handle the error if failed to impersonate
+          DbgPrint(L"\tImpersonateLoggedOnUser failed.\n");
+        }
       }
-    } else if (creationDisposition == OPEN_ALWAYS) {
 
+      //We create folder
       if (!CreateDirectory(filePath, &securityAttrib)) {
-
         error = GetLastError();
-
-        if (error != ERROR_ALREADY_EXISTS) {
+        // Fail to create folder for OPEN_ALWAYS is not an error
+        if (error != ERROR_ALREADY_EXISTS ||
+            creationDisposition == CREATE_NEW) {
           DbgPrint(L"\terror code = %d\n\n", error);
           status = DokanNtStatusFromWin32(error);
         }
       }
+
+      if (g_ImpersonateCallerUser && userTokenHandle != INVALID_HANDLE_VALUE) {
+        // Clean Up operation for impersonate
+        DWORD lastError = GetLastError();
+        if (status != STATUS_SUCCESS) //Keep the handle open for CreateFile
+          CloseHandle(userTokenHandle);
+        RevertToSelf();
+        SetLastError(lastError);
+      }
     }
+
     if (status == STATUS_SUCCESS) {
+
       //Check first if we're trying to open a file as a directory.
       if (fileAttr != INVALID_FILE_ATTRIBUTES &&
           !(fileAttr & FILE_ATTRIBUTE_DIRECTORY) &&
@@ -334,11 +387,27 @@ MirrorCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
         return STATUS_NOT_A_DIRECTORY;
       }
 
+      if (g_ImpersonateCallerUser && userTokenHandle != INVALID_HANDLE_VALUE) {
+        // if g_ImpersonateCallerUser option is on, call the ImpersonateLoggedOnUser function.
+        if (!ImpersonateLoggedOnUser(userTokenHandle)) {
+          // handle the error if failed to impersonate
+          DbgPrint(L"\tImpersonateLoggedOnUser failed.\n");
+        }
+      }
+
       // FILE_FLAG_BACKUP_SEMANTICS is required for opening directory handles
       handle =
-          CreateFile(filePath, genericDesiredAccess, ShareAccess,
-                     &securityAttrib, OPEN_EXISTING,
-                     fileAttributesAndFlags | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+        CreateFile(filePath, genericDesiredAccess, ShareAccess,
+                   &securityAttrib, OPEN_EXISTING,
+                   fileAttributesAndFlags | FILE_FLAG_BACKUP_SEMANTICS, NULL);
+
+      if (g_ImpersonateCallerUser && userTokenHandle != INVALID_HANDLE_VALUE) {
+        // Clean Up operation for impersonate
+        DWORD lastError = GetLastError();
+        CloseHandle(userTokenHandle);
+        RevertToSelf();
+        SetLastError(lastError);
+      }
 
       if (handle == INVALID_HANDLE_VALUE) {
         error = GetLastError();
@@ -347,25 +416,63 @@ MirrorCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
         status = DokanNtStatusFromWin32(error);
       } else {
         DokanFileInfo->Context =
-            (ULONG64)handle; // save the file handle in Context
+          (ULONG64)handle; // save the file handle in Context
+
+        // Open succeed but we need to inform the driver
+        // that the dir open and not created by returning STATUS_OBJECT_NAME_COLLISION
+        if (creationDisposition == OPEN_ALWAYS &&
+            fileAttr != INVALID_FILE_ATTRIBUTES)
+          return STATUS_OBJECT_NAME_COLLISION;
       }
     }
   } else {
     // It is a create file request
 
+    // Cannot overwrite a hidden or system file if flag not set
     if (fileAttr != INVALID_FILE_ATTRIBUTES &&
-        (fileAttr & FILE_ATTRIBUTE_DIRECTORY) &&
-        CreateDisposition == FILE_CREATE)
-      return STATUS_OBJECT_NAME_COLLISION; // File already exist because
-                                           // GetFileAttributes found it
+        ((!(fileAttributesAndFlags & FILE_ATTRIBUTE_HIDDEN) &&
+          (fileAttr & FILE_ATTRIBUTE_HIDDEN)) ||
+         (!(fileAttributesAndFlags & FILE_ATTRIBUTE_SYSTEM) &&
+          (fileAttr & FILE_ATTRIBUTE_SYSTEM))) &&
+        (creationDisposition == TRUNCATE_EXISTING ||
+         creationDisposition == CREATE_ALWAYS))
+      return STATUS_ACCESS_DENIED;
+
+    // Cannot delete a read only file
+    if ((fileAttr != INVALID_FILE_ATTRIBUTES &&
+         (fileAttr & FILE_ATTRIBUTE_READONLY) ||
+         (fileAttributesAndFlags & FILE_ATTRIBUTE_READONLY)) &&
+        (fileAttributesAndFlags & FILE_FLAG_DELETE_ON_CLOSE))
+      return STATUS_CANNOT_DELETE;
+
+    // Truncate should always be used with write access
+    if (creationDisposition == TRUNCATE_EXISTING)
+      genericDesiredAccess |= GENERIC_WRITE;
+
+    if (g_ImpersonateCallerUser && userTokenHandle != INVALID_HANDLE_VALUE) {
+      // if g_ImpersonateCallerUser option is on, call the ImpersonateLoggedOnUser function.
+      if (!ImpersonateLoggedOnUser(userTokenHandle)) {
+        // handle the error if failed to impersonate
+        DbgPrint(L"\tImpersonateLoggedOnUser failed.\n");
+      }
+    }
+
     handle = CreateFile(
-        filePath,
+                        filePath,
         genericDesiredAccess, // GENERIC_READ|GENERIC_WRITE|GENERIC_EXECUTE,
-        ShareAccess,
-        &securityAttrib, // security attribute
-        creationDisposition,
-        fileAttributesAndFlags, // |FILE_FLAG_NO_BUFFERING,
-        NULL);                  // template file handle
+                        ShareAccess,
+                        &securityAttrib, // security attribute
+                        creationDisposition,
+                        fileAttributesAndFlags, // |FILE_FLAG_NO_BUFFERING,
+                        NULL);                  // template file handle
+
+    if (g_ImpersonateCallerUser && userTokenHandle != INVALID_HANDLE_VALUE) {
+      // Clean Up operation for impersonate
+      DWORD lastError = GetLastError();
+      CloseHandle(userTokenHandle);
+      RevertToSelf();
+      SetLastError(lastError);
+    }
 
     if (handle == INVALID_HANDLE_VALUE) {
       error = GetLastError();
@@ -373,8 +480,15 @@ MirrorCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
 
       status = DokanNtStatusFromWin32(error);
     } else {
+
+      //Need to update FileAttributes with previous when Overwrite file
+      if (fileAttr != INVALID_FILE_ATTRIBUTES &&
+          creationDisposition == TRUNCATE_EXISTING) {
+        SetFileAttributes(filePath, fileAttributesAndFlags | fileAttr);
+      }
+
       DokanFileInfo->Context =
-          (ULONG64)handle; // save the file handle in Context
+        (ULONG64)handle; // save the file handle in Context
 
       if (creationDisposition == OPEN_ALWAYS ||
           creationDisposition == CREATE_ALWAYS) {
@@ -383,7 +497,7 @@ MirrorCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
           DbgPrint(L"\tOpen an already existing file\n");
           // Open succeed but we need to inform the driver
           // that the file open and not created by returning STATUS_OBJECT_NAME_COLLISION
-          return STATUS_OBJECT_NAME_COLLISION;
+          status = STATUS_OBJECT_NAME_COLLISION;
         }
       }
     }
@@ -398,8 +512,8 @@ MirrorCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
 
 static void DOKAN_CALLBACK MirrorCloseFile(LPCWSTR FileName,
                                            PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
-  GetFilePath(filePath, MAX_PATH, FileName);
+  WCHAR filePath[DOKAN_MAX_PATH];
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   if (DokanFileInfo->Context) {
     DbgPrint(L"CloseFile: %s\n", filePath);
@@ -413,8 +527,8 @@ static void DOKAN_CALLBACK MirrorCloseFile(LPCWSTR FileName,
 
 static void DOKAN_CALLBACK MirrorCleanup(LPCWSTR FileName,
                                          PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
-  GetFilePath(filePath, MAX_PATH, FileName);
+  WCHAR filePath[DOKAN_MAX_PATH];
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   if (DokanFileInfo->Context) {
     DbgPrint(L"Cleanup: %s\n\n", filePath);
@@ -451,12 +565,12 @@ static NTSTATUS DOKAN_CALLBACK MirrorReadFile(LPCWSTR FileName, LPVOID Buffer,
                                               LPDWORD ReadLength,
                                               LONGLONG Offset,
                                               PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  WCHAR filePath[DOKAN_MAX_PATH];
   HANDLE handle = (HANDLE)DokanFileInfo->Context;
   ULONG offset = (ULONG)Offset;
   BOOL opened = FALSE;
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"ReadFile : %s\n", filePath);
 
@@ -506,11 +620,11 @@ static NTSTATUS DOKAN_CALLBACK MirrorWriteFile(LPCWSTR FileName, LPCVOID Buffer,
                                                LPDWORD NumberOfBytesWritten,
                                                LONGLONG Offset,
                                                PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  WCHAR filePath[DOKAN_MAX_PATH];
   HANDLE handle = (HANDLE)DokanFileInfo->Context;
   BOOL opened = FALSE;
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"WriteFile : %s, offset %I64d, length %d\n", filePath, Offset,
            NumberOfBytesToWrite);
@@ -612,10 +726,10 @@ static NTSTATUS DOKAN_CALLBACK MirrorWriteFile(LPCWSTR FileName, LPCVOID Buffer,
 
 static NTSTATUS DOKAN_CALLBACK
 MirrorFlushFileBuffers(LPCWSTR FileName, PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  WCHAR filePath[DOKAN_MAX_PATH];
   HANDLE handle = (HANDLE)DokanFileInfo->Context;
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"FlushFileBuffers : %s\n", filePath);
 
@@ -634,13 +748,13 @@ MirrorFlushFileBuffers(LPCWSTR FileName, PDOKAN_FILE_INFO DokanFileInfo) {
 }
 
 static NTSTATUS DOKAN_CALLBACK MirrorGetFileInformation(
-    LPCWSTR FileName, LPBY_HANDLE_FILE_INFORMATION HandleFileInformation,
-    PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  LPCWSTR FileName, LPBY_HANDLE_FILE_INFORMATION HandleFileInformation,
+  PDOKAN_FILE_INFO DokanFileInfo) {
+  WCHAR filePath[DOKAN_MAX_PATH];
   HANDLE handle = (HANDLE)DokanFileInfo->Context;
   BOOL opened = FALSE;
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"GetFileInfo : %s\n", filePath);
 
@@ -690,7 +804,7 @@ static NTSTATUS DOKAN_CALLBACK MirrorGetFileInformation(
              HandleFileInformation->nFileSizeLow);
   }
 
-  DbgPrint(L"\n");
+  DbgPrint(L"FILE ATTRIBUTE  = %d\n", HandleFileInformation->dwFileAttributes);
 
   if (opened)
     CloseHandle(handle);
@@ -702,21 +816,23 @@ static NTSTATUS DOKAN_CALLBACK
 MirrorFindFiles(LPCWSTR FileName,
                 PFillFindData FillFindData, // function pointer
                 PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  WCHAR filePath[DOKAN_MAX_PATH];
   size_t fileLen;
   HANDLE hFind;
   WIN32_FIND_DATAW findData;
   DWORD error;
   int count = 0;
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
-  DbgPrint(L"FindFiles :%s\n", filePath);
+  DbgPrint(L"FindFiles : %s\n", filePath);
 
   fileLen = wcslen(filePath);
   if (filePath[fileLen - 1] != L'\\') {
     filePath[fileLen++] = L'\\';
   }
+  if (fileLen + 1 >= DOKAN_MAX_PATH)
+    return STATUS_BUFFER_OVERFLOW;
   filePath[fileLen] = L'*';
   filePath[fileLen + 1] = L'\0';
 
@@ -752,10 +868,10 @@ MirrorFindFiles(LPCWSTR FileName,
 
 static NTSTATUS DOKAN_CALLBACK
 MirrorDeleteFile(LPCWSTR FileName, PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  WCHAR filePath[DOKAN_MAX_PATH];
   HANDLE handle = (HANDLE)DokanFileInfo->Context;
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
   DbgPrint(L"DeleteFile %s - %d\n", filePath, DokanFileInfo->DeleteOnClose);
 
   DWORD dwAttrib = GetFileAttributes(filePath);
@@ -777,14 +893,14 @@ MirrorDeleteFile(LPCWSTR FileName, PDOKAN_FILE_INFO DokanFileInfo) {
 
 static NTSTATUS DOKAN_CALLBACK
 MirrorDeleteDirectory(LPCWSTR FileName, PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  WCHAR filePath[DOKAN_MAX_PATH];
   // HANDLE	handle = (HANDLE)DokanFileInfo->Context;
   HANDLE hFind;
   WIN32_FIND_DATAW findData;
   size_t fileLen;
 
   ZeroMemory(filePath, sizeof(filePath));
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"DeleteDirectory %s - %d\n", filePath,
            DokanFileInfo->DeleteOnClose);
@@ -797,6 +913,8 @@ MirrorDeleteDirectory(LPCWSTR FileName, PDOKAN_FILE_INFO DokanFileInfo) {
   if (filePath[fileLen - 1] != L'\\') {
     filePath[fileLen++] = L'\\';
   }
+  if (fileLen + 1 >= DOKAN_MAX_PATH)
+    return STATUS_BUFFER_OVERFLOW;
   filePath[fileLen] = L'*';
   filePath[fileLen + 1] = L'\0';
 
@@ -819,12 +937,12 @@ MirrorDeleteDirectory(LPCWSTR FileName, PDOKAN_FILE_INFO DokanFileInfo) {
 
   DWORD error = GetLastError();
 
+  FindClose(hFind);
+
   if (error != ERROR_NO_MORE_FILES) {
     DbgPrint(L"\tDeleteDirectory error code = %d\n\n", error);
     return DokanNtStatusFromWin32(error);
   }
-
-  FindClose(hFind);
 
   return STATUS_SUCCESS;
 }
@@ -833,8 +951,8 @@ static NTSTATUS DOKAN_CALLBACK
 MirrorMoveFile(LPCWSTR FileName, // existing file name
                LPCWSTR NewFileName, BOOL ReplaceIfExisting,
                PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
-  WCHAR newFilePath[MAX_PATH];
+  WCHAR filePath[DOKAN_MAX_PATH];
+  WCHAR newFilePath[DOKAN_MAX_PATH];
   HANDLE handle;
   DWORD bufferSize;
   BOOL result;
@@ -842,8 +960,14 @@ MirrorMoveFile(LPCWSTR FileName, // existing file name
 
   PFILE_RENAME_INFO renameInfo = NULL;
 
-  GetFilePath(filePath, MAX_PATH, FileName);
-  GetFilePath(newFilePath, MAX_PATH, NewFileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
+  if (wcslen(NewFileName) && NewFileName[0] != ':') {
+    GetFilePath(newFilePath, DOKAN_MAX_PATH, NewFileName);
+  } else {
+    // For a stream rename, FileRenameInfo expect the FileName param without the filename
+    // like :<stream name>:<stream type>
+    wcsncpy_s(newFilePath, DOKAN_MAX_PATH, NewFileName, wcslen(NewFileName));
+  }
 
   DbgPrint(L"MoveFile %s -> %s\n\n", filePath, newFilePath);
   handle = (HANDLE)DokanFileInfo->Context;
@@ -868,13 +992,13 @@ MirrorMoveFile(LPCWSTR FileName, // existing file name
   ZeroMemory(renameInfo, bufferSize);
 
   renameInfo->ReplaceIfExists =
-      ReplaceIfExisting
-          ? TRUE
+    ReplaceIfExisting
+      ? TRUE
           : FALSE; // some warning about converting BOOL to BOOLEAN
   renameInfo->RootDirectory = NULL; // hope it is never needed, shouldn't be
   renameInfo->FileNameLength =
-      (DWORD)newFilePathLen *
-      sizeof(newFilePath[0]); // they want length in bytes
+    (DWORD)newFilePathLen *
+    sizeof(newFilePath[0]); // they want length in bytes
 
   wcscpy_s(renameInfo->FileName, newFilePathLen + 1, newFilePath);
 
@@ -896,12 +1020,12 @@ static NTSTATUS DOKAN_CALLBACK MirrorLockFile(LPCWSTR FileName,
                                               LONGLONG ByteOffset,
                                               LONGLONG Length,
                                               PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  WCHAR filePath[DOKAN_MAX_PATH];
   HANDLE handle;
   LARGE_INTEGER offset;
   LARGE_INTEGER length;
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"LockFile %s\n", filePath);
 
@@ -926,12 +1050,12 @@ static NTSTATUS DOKAN_CALLBACK MirrorLockFile(LPCWSTR FileName,
 }
 
 static NTSTATUS DOKAN_CALLBACK MirrorSetEndOfFile(
-    LPCWSTR FileName, LONGLONG ByteOffset, PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  LPCWSTR FileName, LONGLONG ByteOffset, PDOKAN_FILE_INFO DokanFileInfo) {
+  WCHAR filePath[DOKAN_MAX_PATH];
   HANDLE handle;
   LARGE_INTEGER offset;
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"SetEndOfFile %s, %I64d\n", filePath, ByteOffset);
 
@@ -959,12 +1083,12 @@ static NTSTATUS DOKAN_CALLBACK MirrorSetEndOfFile(
 }
 
 static NTSTATUS DOKAN_CALLBACK MirrorSetAllocationSize(
-    LPCWSTR FileName, LONGLONG AllocSize, PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  LPCWSTR FileName, LONGLONG AllocSize, PDOKAN_FILE_INFO DokanFileInfo) {
+  WCHAR filePath[DOKAN_MAX_PATH];
   HANDLE handle;
   LARGE_INTEGER fileSize;
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"SetAllocationSize %s, %I64d\n", filePath, AllocSize);
 
@@ -999,19 +1123,27 @@ static NTSTATUS DOKAN_CALLBACK MirrorSetAllocationSize(
 }
 
 static NTSTATUS DOKAN_CALLBACK MirrorSetFileAttributes(
-    LPCWSTR FileName, DWORD FileAttributes, PDOKAN_FILE_INFO DokanFileInfo) {
+  LPCWSTR FileName, DWORD FileAttributes, PDOKAN_FILE_INFO DokanFileInfo) {
   UNREFERENCED_PARAMETER(DokanFileInfo);
 
-  WCHAR filePath[MAX_PATH];
+  WCHAR filePath[DOKAN_MAX_PATH];
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
-  DbgPrint(L"SetFileAttributes %s\n", filePath);
+  DbgPrint(L"SetFileAttributes %s 0x%x\n", filePath, FileAttributes);
 
-  if (!SetFileAttributes(filePath, FileAttributes)) {
-    DWORD error = GetLastError();
-    DbgPrint(L"\terror code = %d\n\n", error);
-    return DokanNtStatusFromWin32(error);
+  if (FileAttributes != 0) {
+    if (!SetFileAttributes(filePath, FileAttributes)) {
+      DWORD error = GetLastError();
+      DbgPrint(L"\terror code = %d\n\n", error);
+      return DokanNtStatusFromWin32(error);
+    }
+  } else {
+    // case FileAttributes == 0 :
+    // MS-FSCC 2.6 File Attributes : There is no file attribute with the value 0x00000000
+    // because a value of 0x00000000 in the FileAttributes field means that the file attributes for this file MUST NOT be changed when setting basic information for the file
+    DbgPrint(L"Set 0 to FileAttributes means MUST NOT be changed. Didn't call "
+             L"SetFileAttributes function. \n");
   }
 
   DbgPrint(L"\n");
@@ -1022,10 +1154,10 @@ static NTSTATUS DOKAN_CALLBACK
 MirrorSetFileTime(LPCWSTR FileName, CONST FILETIME *CreationTime,
                   CONST FILETIME *LastAccessTime, CONST FILETIME *LastWriteTime,
                   PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  WCHAR filePath[DOKAN_MAX_PATH];
   HANDLE handle;
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"SetFileTime %s\n", filePath);
 
@@ -1049,12 +1181,12 @@ MirrorSetFileTime(LPCWSTR FileName, CONST FILETIME *CreationTime,
 static NTSTATUS DOKAN_CALLBACK
 MirrorUnlockFile(LPCWSTR FileName, LONGLONG ByteOffset, LONGLONG Length,
                  PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  WCHAR filePath[DOKAN_MAX_PATH];
   HANDLE handle;
   LARGE_INTEGER length;
   LARGE_INTEGER offset;
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"UnlockFile %s\n", filePath);
 
@@ -1079,15 +1211,15 @@ MirrorUnlockFile(LPCWSTR FileName, LONGLONG ByteOffset, LONGLONG Length,
 }
 
 static NTSTATUS DOKAN_CALLBACK MirrorGetFileSecurity(
-    LPCWSTR FileName, PSECURITY_INFORMATION SecurityInformation,
-    PSECURITY_DESCRIPTOR SecurityDescriptor, ULONG BufferLength,
-    PULONG LengthNeeded, PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  LPCWSTR FileName, PSECURITY_INFORMATION SecurityInformation,
+  PSECURITY_DESCRIPTOR SecurityDescriptor, ULONG BufferLength,
+  PULONG LengthNeeded, PDOKAN_FILE_INFO DokanFileInfo) {
+  WCHAR filePath[DOKAN_MAX_PATH];
   BOOLEAN requestingSaclInfo;
 
   UNREFERENCED_PARAMETER(DokanFileInfo);
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"GetFileSecurity %s\n", filePath);
 
@@ -1100,7 +1232,7 @@ static NTSTATUS DOKAN_CALLBACK MirrorGetFileSecurity(
   MirrorCheckFlag(*SecurityInformation, ATTRIBUTE_SECURITY_INFORMATION);
   MirrorCheckFlag(*SecurityInformation, SCOPE_SECURITY_INFORMATION);
   MirrorCheckFlag(*SecurityInformation,
-                  PROCESS_TRUST_LABEL_SECURITY_INFORMATION);
+    PROCESS_TRUST_LABEL_SECURITY_INFORMATION);
   MirrorCheckFlag(*SecurityInformation, BACKUP_SECURITY_INFORMATION);
   MirrorCheckFlag(*SecurityInformation, PROTECTED_DACL_SECURITY_INFORMATION);
   MirrorCheckFlag(*SecurityInformation, PROTECTED_SACL_SECURITY_INFORMATION);
@@ -1117,9 +1249,10 @@ static NTSTATUS DOKAN_CALLBACK MirrorGetFileSecurity(
 
   DbgPrint(L"  Opening new handle with READ_CONTROL access\n");
   HANDLE handle = CreateFile(
-      filePath, READ_CONTROL | ((requestingSaclInfo && g_HasSeSecurityPrivilege)
-                                    ? ACCESS_SYSTEM_SECURITY
-                                    : 0),
+      filePath,
+      READ_CONTROL | ((requestingSaclInfo && g_HasSeSecurityPrivilege)
+                          ? ACCESS_SYSTEM_SECURITY
+                          : 0),
       FILE_SHARE_WRITE | FILE_SHARE_READ | FILE_SHARE_DELETE,
       NULL, // security attribute
       OPEN_EXISTING,
@@ -1145,21 +1278,29 @@ static NTSTATUS DOKAN_CALLBACK MirrorGetFileSecurity(
       return DokanNtStatusFromWin32(error);
     }
   }
+
+  // Ensure the Security Descriptor Length is set
+  DWORD securityDescriptorLength =
+    GetSecurityDescriptorLength(SecurityDescriptor);
+  DbgPrint(L"  GetUserObjectSecurity return true,  *LengthNeeded = "
+           L"securityDescriptorLength \n");
+  *LengthNeeded = securityDescriptorLength;
+
   CloseHandle(handle);
 
   return STATUS_SUCCESS;
 }
 
 static NTSTATUS DOKAN_CALLBACK MirrorSetFileSecurity(
-    LPCWSTR FileName, PSECURITY_INFORMATION SecurityInformation,
-    PSECURITY_DESCRIPTOR SecurityDescriptor, ULONG SecurityDescriptorLength,
-    PDOKAN_FILE_INFO DokanFileInfo) {
+  LPCWSTR FileName, PSECURITY_INFORMATION SecurityInformation,
+  PSECURITY_DESCRIPTOR SecurityDescriptor, ULONG SecurityDescriptorLength,
+  PDOKAN_FILE_INFO DokanFileInfo) {
   HANDLE handle;
-  WCHAR filePath[MAX_PATH];
+  WCHAR filePath[DOKAN_MAX_PATH];
 
   UNREFERENCED_PARAMETER(SecurityDescriptorLength);
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"SetFileSecurity %s\n", filePath);
 
@@ -1178,29 +1319,70 @@ static NTSTATUS DOKAN_CALLBACK MirrorSetFileSecurity(
 }
 
 static NTSTATUS DOKAN_CALLBACK MirrorGetVolumeInformation(
-    LPWSTR VolumeNameBuffer, DWORD VolumeNameSize, LPDWORD VolumeSerialNumber,
-    LPDWORD MaximumComponentLength, LPDWORD FileSystemFlags,
-    LPWSTR FileSystemNameBuffer, DWORD FileSystemNameSize,
-    PDOKAN_FILE_INFO DokanFileInfo) {
+  LPWSTR VolumeNameBuffer, DWORD VolumeNameSize, LPDWORD VolumeSerialNumber,
+  LPDWORD MaximumComponentLength, LPDWORD FileSystemFlags,
+  LPWSTR FileSystemNameBuffer, DWORD FileSystemNameSize,
+  PDOKAN_FILE_INFO DokanFileInfo) {
   UNREFERENCED_PARAMETER(DokanFileInfo);
 
-  wcscpy_s(VolumeNameBuffer, VolumeNameSize, L"DOKAN");
-  *VolumeSerialNumber = 0x19831116;
-  *MaximumComponentLength = 256;
-  *FileSystemFlags = FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES |
-                     FILE_SUPPORTS_REMOTE_STORAGE | FILE_UNICODE_ON_DISK |
-                     FILE_PERSISTENT_ACLS;
+  WCHAR volumeRoot[4];
+  DWORD fsFlags = 0;
 
-  // File system name could be anything up to 10 characters.
-  // But Windows check few feature availability based on file system name.
-  // For this, it is recommended to set NTFS or FAT here.
-  wcscpy_s(FileSystemNameBuffer, FileSystemNameSize, L"NTFS");
+  wcscpy_s(VolumeNameBuffer, VolumeNameSize, L"DOKAN");
+
+  if (VolumeSerialNumber)
+    *VolumeSerialNumber = 0x19831116;
+  if (MaximumComponentLength)
+    *MaximumComponentLength = 255;
+  if (FileSystemFlags) {
+    *FileSystemFlags = FILE_SUPPORTS_REMOTE_STORAGE | FILE_UNICODE_ON_DISK |
+                       FILE_PERSISTENT_ACLS | FILE_NAMED_STREAMS;
+    if (g_CaseSensitive)
+      *FileSystemFlags = FILE_CASE_SENSITIVE_SEARCH | FILE_CASE_PRESERVED_NAMES;
+  }
+
+  volumeRoot[0] = RootDirectory[0];
+  volumeRoot[1] = ':';
+  volumeRoot[2] = '\\';
+  volumeRoot[3] = '\0';
+
+  if (GetVolumeInformation(volumeRoot, NULL, 0, NULL, MaximumComponentLength,
+                           &fsFlags, FileSystemNameBuffer,
+                           FileSystemNameSize)) {
+
+    if (FileSystemFlags)
+      *FileSystemFlags &= fsFlags;
+
+    if (MaximumComponentLength) {
+      DbgPrint(L"GetVolumeInformation: max component length %u\n",
+               *MaximumComponentLength);
+    }
+    if (FileSystemNameBuffer) {
+      DbgPrint(L"GetVolumeInformation: file system name %s\n",
+               FileSystemNameBuffer);
+    }
+    if (FileSystemFlags) {
+      DbgPrint(L"GetVolumeInformation: got file system flags 0x%08x,"
+               L" returning 0x%08x\n",
+               fsFlags, *FileSystemFlags);
+    }
+  } else {
+
+    DbgPrint(L"GetVolumeInformation: unable to query underlying fs,"
+             L" using defaults.  Last error = %u\n",
+             GetLastError());
+
+    // File system name could be anything up to 10 characters.
+    // But Windows check few feature availability based on file system name.
+    // For this, it is recommended to set NTFS or FAT here.
+    wcscpy_s(FileSystemNameBuffer, FileSystemNameSize, L"NTFS");
+  }
 
   return STATUS_SUCCESS;
 }
 
+// Uncomment the function and set dokanOperations.GetDiskFreeSpace to personalize disk space
 /*
-//Uncomment for personalize disk space
 static NTSTATUS DOKAN_CALLBACK MirrorDokanGetDiskFreeSpace(
     PULONGLONG FreeBytesAvailable, PULONGLONG TotalNumberOfBytes,
     PULONGLONG TotalNumberOfFreeBytes, PDOKAN_FILE_INFO DokanFileInfo) {
@@ -1213,6 +1395,36 @@ static NTSTATUS DOKAN_CALLBACK MirrorDokanGetDiskFreeSpace(
   return STATUS_SUCCESS;
 }
 */
+
+static NTSTATUS DOKAN_CALLBACK MirrorDokanGetDiskFreeSpace(
+    PULONGLONG FreeBytesAvailable, PULONGLONG TotalNumberOfBytes,
+    PULONGLONG TotalNumberOfFreeBytes, PDOKAN_FILE_INFO DokanFileInfo) {
+  UNREFERENCED_PARAMETER(DokanFileInfo);
+
+  DWORD SectorsPerCluster;
+  DWORD BytesPerSector;
+  DWORD NumberOfFreeClusters;
+  DWORD TotalNumberOfClusters;
+  WCHAR DriveLetter[3] = {'C', ':', 0};
+  PWCHAR RootPathName;
+
+  if (RootDirectory[0] == L'\\') { // UNC as Root
+    RootPathName = RootDirectory;
+  } else {
+    DriveLetter[0] = RootDirectory[0];
+    RootPathName = DriveLetter;
+  }
+
+  GetDiskFreeSpace(RootPathName, &SectorsPerCluster, &BytesPerSector,
+                   &NumberOfFreeClusters, &TotalNumberOfClusters);
+  *FreeBytesAvailable =
+      ((ULONGLONG)SectorsPerCluster) * BytesPerSector * NumberOfFreeClusters;
+  *TotalNumberOfFreeBytes =
+      ((ULONGLONG)SectorsPerCluster) * BytesPerSector * NumberOfFreeClusters;
+  *TotalNumberOfBytes =
+      ((ULONGLONG)SectorsPerCluster) * BytesPerSector * TotalNumberOfClusters;
+  return STATUS_SUCCESS;
+}
 
 /**
  * Avoid #include <winternl.h> which as conflict with FILE_INFORMATION_CLASS
@@ -1246,13 +1458,13 @@ NTSYSCALLAPI NTSTATUS NTAPI NtQueryInformationFile(
 NTSTATUS DOKAN_CALLBACK
 MirrorFindStreams(LPCWSTR FileName, PFillFindStreamData FillFindStreamData,
                   PDOKAN_FILE_INFO DokanFileInfo) {
-  WCHAR filePath[MAX_PATH];
+  WCHAR filePath[DOKAN_MAX_PATH];
   HANDLE hFind;
   WIN32_FIND_STREAM_DATA findData;
   DWORD error;
   int count = 0;
 
-  GetFilePath(filePath, MAX_PATH, FileName);
+  GetFilePath(filePath, DOKAN_MAX_PATH, FileName);
 
   DbgPrint(L"FindStreams :%s\n", filePath);
 
@@ -1318,74 +1530,83 @@ BOOL WINAPI CtrlHandler(DWORD dwCtrlType) {
 
 void ShowUsage() {
   // clang-format off
-  fprintf(stderr, "mirror.exe\n"
-    "  /r RootDirectory (ex. /r c:\\test)\t\t Directory source to mirror.\n"
-    "  /l MountPoint (ex. /l m)\t\t\t Mount point. Can be M:\\ (drive letter) or empty NTFS folder C:\\mount\\dokan .\n"
-    "  /t ThreadCount (ex. /t 5)\t\t\t Number of threads to be used internally by Dokan library.\n\t\t\t\t\t\t More threads will handle more event at the same time.\n"
-    "  /d (enable debug output)\t\t\t Enable debug output to an attached debugger.\n"
-    "  /s (use stderr for output)\t\t\t Enable debug output to stderr.\n"
-    "  /n (use network drive)\t\t\t Show device as network device.\n"
-    "  /m (use removable drive)\t\t\t Show device as removable media.\n"
-    "  /w (write-protect drive)\t\t\t Read only filesystem.\n"
-    "  /o (use mount manager)\t\t\t Register device to Windows mount manager.\n\t\t\t\t\t\t This enables advanced Windows features like recycle bin and more...\n"
-    "  /c (mount for current session only)\t\t Device only visible for current user session.\n"
-    "  /u (UNC provider name ex. \\localhost\\myfs)\t UNC name used for network volume.\n"
-    "  /a Allocation unit size (ex. /a 512)\t\t Allocation Unit Size of the volume. This will behave on the disk file size.\n"
-    "  /k Sector size (ex. /k 512)\t\t\t Sector Size of the volume. This will behave on the disk file size.\n"
-    "  /f User mode Lock\t\t\t\t Enable Lockfile/Unlockfile operations. Otherwise Dokan will take care of it.\n"
-    "  /i (Timeout in Milliseconds ex. /i 30000)\t Timeout until a running operation is aborted and the device is unmounted.\n\n"
-    "Examples:\n"
-    "\tmirror.exe /r C:\\Users /l M:\t\t\t# Mirror C:\\Users as RootDirectory into a drive of letter M:\\.\n"
-    "\tmirror.exe /r C:\\Users /l C:\\mount\\dokan\t# Mirror C:\\Users as RootDirectory into NTFS folder C:\\mount\\dokan.\n"
-    "\tmirror.exe /r C:\\Users /l M: /n /u \\myfs\\myfs1\t# Mirror C:\\Users as RootDirectory into a network drive M:\\. with UNC \\\\myfs\\myfs1\n\n"
-    "Unmount the drive with CTRL + C in the console or alternatively via \"dokanctl /u MountPoint\".\n");
+  fprintf(stderr, "mirror.exe - Mirror a local device or folder to secondary device, an NTFS folder or a network device.\n"
+          "  /r RootDirectory (ex. /r c:\\test)\t\t Directory source to mirror.\n"
+          "  /l MountPoint (ex. /l m)\t\t\t Mount point. Can be M:\\ (drive letter) or empty NTFS folder C:\\mount\\dokan .\n"
+          "  /t ThreadCount (ex. /t 5)\t\t\t Number of threads to be used internally by Dokan library.\n\t\t\t\t\t\t More threads will handle more event at the same time.\n"
+          "  /d (enable debug output)\t\t\t Enable debug output to an attached debugger.\n"
+          "  /s (use stderr for output)\t\t\t Enable debug output to stderr.\n"
+          "  /n (use network drive)\t\t\t Show device as network device.\n"
+          "  /m (use removable drive)\t\t\t Show device as removable media.\n"
+          "  /w (write-protect drive)\t\t\t Read only filesystem.\n"
+          "  /b (case sensitive drive)\t\t\t Supports case-sensitive file names.\n"
+          "  /o (use mount manager)\t\t\t Register device to Windows mount manager.\n\t\t\t\t\t\t This enables advanced Windows features like recycle bin and more...\n"
+          "  /c (mount for current session only)\t\t Device only visible for current user session.\n"
+          "  /u (UNC provider name ex. \\localhost\\myfs)\t UNC name used for network volume.\n"
+          "  /p (Impersonate Caller User)\t\t\t Impersonate Caller User when getting the handle in CreateFile for operations.\n\t\t\t\t\t\t This option requires administrator right to work properly.\n"
+          "  /a Allocation unit size (ex. /a 512)\t\t Allocation Unit Size of the volume. This will behave on the disk file size.\n"
+          "  /k Sector size (ex. /k 512)\t\t\t Sector Size of the volume. This will behave on the disk file size.\n"
+          "  /f User mode Lock\t\t\t\t Enable Lockfile/Unlockfile operations. Otherwise Dokan will take care of it.\n"
+          "  /e Disable OpLocks\t\t\t\t Disable OpLocks kernel operations. Otherwise Dokan will take care of it.\n"
+          "  /i (Timeout in Milliseconds ex. /i 30000)\t Timeout until a running operation is aborted and the device is unmounted.\n"
+          "  /z Enabled FCB GC. Might speed up on env with filter drivers (Anti-virus) slowing down the system.\n"
+          "  /x (network unmount)\t\t\t Allows unmounting network drive from file explorer\n\n"
+          "Examples:\n"
+          "\tmirror.exe /r C:\\Users /l M:\t\t\t# Mirror C:\\Users as RootDirectory into a drive of letter M:\\.\n"
+          "\tmirror.exe /r C:\\Users /l C:\\mount\\dokan\t# Mirror C:\\Users as RootDirectory into NTFS folder C:\\mount\\dokan.\n"
+          "\tmirror.exe /r C:\\Users /l M: /n /u \\myfs\\myfs1\t# Mirror C:\\Users as RootDirectory into a network drive M:\\. with UNC \\\\myfs\\myfs1\n\n"
+          "Unmount the drive with CTRL + C in the console or alternatively via \"dokanctl /u MountPoint\".\n");
   // clang-format on
 }
+
+#define CHECK_CMD_ARG(commad, argc)                                            \
+  {                                                                            \
+    if (++command == argc) {                                                   \
+      fwprintf(stderr, L"Option is missing an argument.\n");                   \
+      return EXIT_FAILURE;                                                     \
+    }                                                                          \
+  }
 
 int __cdecl wmain(ULONG argc, PWCHAR argv[]) {
   int status;
   ULONG command;
-  PDOKAN_OPERATIONS dokanOperations =
-      (PDOKAN_OPERATIONS)malloc(sizeof(DOKAN_OPERATIONS));
-  if (dokanOperations == NULL) {
-    return EXIT_FAILURE;
-  }
-  PDOKAN_OPTIONS dokanOptions = (PDOKAN_OPTIONS)malloc(sizeof(DOKAN_OPTIONS));
-  if (dokanOptions == NULL) {
-    free(dokanOperations);
-    return EXIT_FAILURE;
-  }
+  DOKAN_OPERATIONS dokanOperations;
+  DOKAN_OPTIONS dokanOptions;
 
   if (argc < 3) {
     ShowUsage();
-    free(dokanOperations);
-    free(dokanOptions);
     return EXIT_FAILURE;
   }
 
   g_DebugMode = FALSE;
   g_UseStdErr = FALSE;
+  g_CaseSensitive = FALSE;
 
-  ZeroMemory(dokanOptions, sizeof(DOKAN_OPTIONS));
-  dokanOptions->Version = DOKAN_VERSION;
-  dokanOptions->ThreadCount = 0; // use default
+  ZeroMemory(&dokanOptions, sizeof(DOKAN_OPTIONS));
+  dokanOptions.Version = DOKAN_VERSION;
+  dokanOptions.ThreadCount = 0; // use default
 
   for (command = 1; command < argc; command++) {
     switch (towlower(argv[command][1])) {
     case L'r':
-      command++;
+      CHECK_CMD_ARG(command, argc)
       wcscpy_s(RootDirectory, sizeof(RootDirectory) / sizeof(WCHAR),
                argv[command]);
+      if (!wcslen(RootDirectory)) {
+        DbgPrint(L"Invalid RootDirectory\n");
+        return EXIT_FAILURE;
+      }
+
       DbgPrint(L"RootDirectory: %ls\n", RootDirectory);
       break;
     case L'l':
-      command++;
+      CHECK_CMD_ARG(command, argc)
       wcscpy_s(MountPoint, sizeof(MountPoint) / sizeof(WCHAR), argv[command]);
-      dokanOptions->MountPoint = MountPoint;
+      dokanOptions.MountPoint = MountPoint;
       break;
     case L't':
-      command++;
-      dokanOptions->ThreadCount = (USHORT)_wtoi(argv[command]);
+      CHECK_CMD_ARG(command, argc)
+      dokanOptions.ThreadCount = (USHORT)_wtoi(argv[command]);
       break;
     case L'd':
       g_DebugMode = TRUE;
@@ -1394,78 +1615,87 @@ int __cdecl wmain(ULONG argc, PWCHAR argv[]) {
       g_UseStdErr = TRUE;
       break;
     case L'n':
-      dokanOptions->Options |= DOKAN_OPTION_NETWORK;
+      dokanOptions.Options |= DOKAN_OPTION_NETWORK;
       break;
     case L'm':
-      dokanOptions->Options |= DOKAN_OPTION_REMOVABLE;
+      dokanOptions.Options |= DOKAN_OPTION_REMOVABLE;
       break;
     case L'w':
-      dokanOptions->Options |= DOKAN_OPTION_WRITE_PROTECT;
+      dokanOptions.Options |= DOKAN_OPTION_WRITE_PROTECT;
       break;
     case L'o':
-      dokanOptions->Options |= DOKAN_OPTION_MOUNT_MANAGER;
+      dokanOptions.Options |= DOKAN_OPTION_MOUNT_MANAGER;
       break;
     case L'c':
-      dokanOptions->Options |= DOKAN_OPTION_CURRENT_SESSION;
+      dokanOptions.Options |= DOKAN_OPTION_CURRENT_SESSION;
       break;
     case L'f':
-      dokanOptions->Options |= DOKAN_OPTION_FILELOCK_USER_MODE;
+      dokanOptions.Options |= DOKAN_OPTION_FILELOCK_USER_MODE;
+      break;
+    case L'e':
+      dokanOptions.Options |= DOKAN_OPTION_DISABLE_OPLOCKS;
+      break;
+    case L'z':
+      dokanOptions.Options |= DOKAN_OPTION_ENABLE_FCB_GARBAGE_COLLECTION;
+      break;
+    case L'x':
+      dokanOptions.Options |= DOKAN_OPTION_ENABLE_UNMOUNT_NETWORK_DRIVE;
+      break;
+    case L'b':
+      // Only work when mirroring a folder with setCaseSensitiveInfo option enabled on win10
+      dokanOptions.Options |= DOKAN_OPTION_CASE_SENSITIVE;
+      g_CaseSensitive = TRUE;
       break;
     case L'u':
-      command++;
+      CHECK_CMD_ARG(command, argc)
       wcscpy_s(UNCName, sizeof(UNCName) / sizeof(WCHAR), argv[command]);
-      dokanOptions->UNCName = UNCName;
+      dokanOptions.UNCName = UNCName;
       DbgPrint(L"UNC Name: %ls\n", UNCName);
       break;
+    case L'p':
+      g_ImpersonateCallerUser = TRUE;
+      break;
     case L'i':
-      command++;
-      dokanOptions->Timeout = (ULONG)_wtol(argv[command]);
+      CHECK_CMD_ARG(command, argc)
+      dokanOptions.Timeout = (ULONG)_wtol(argv[command]);
       break;
     case L'a':
-      command++;
-      dokanOptions->AllocationUnitSize = (ULONG)_wtol(argv[command]);
+      CHECK_CMD_ARG(command, argc)
+      dokanOptions.AllocationUnitSize = (ULONG)_wtol(argv[command]);
       break;
     case L'k':
-      command++;
-      dokanOptions->SectorSize = (ULONG)_wtol(argv[command]);
+      CHECK_CMD_ARG(command, argc)
+      dokanOptions.SectorSize = (ULONG)_wtol(argv[command]);
       break;
     default:
-      fwprintf(stderr, L"unknown command: %s\n", argv[command]);
-      free(dokanOperations);
-      free(dokanOptions);
+      fwprintf(stderr, L"unknown command: %ls\n", argv[command]);
       return EXIT_FAILURE;
     }
   }
 
   if (wcscmp(UNCName, L"") != 0 &&
-      !(dokanOptions->Options & DOKAN_OPTION_NETWORK)) {
+      !(dokanOptions.Options & DOKAN_OPTION_NETWORK)) {
     fwprintf(
-        stderr,
-        L"  Warning: UNC provider name should be set on network drive only.\n");
+             stderr,
+             L"  Warning: UNC provider name should be set on network drive only.\n");
   }
 
-  if (dokanOptions->Options & DOKAN_OPTION_NETWORK &&
-      dokanOptions->Options & DOKAN_OPTION_MOUNT_MANAGER) {
+  if (dokanOptions.Options & DOKAN_OPTION_NETWORK &&
+      dokanOptions.Options & DOKAN_OPTION_MOUNT_MANAGER) {
     fwprintf(stderr, L"Mount manager cannot be used on network drive.\n");
-    free(dokanOperations);
-    free(dokanOptions);
     return EXIT_FAILURE;
   }
 
-  if (!(dokanOptions->Options & DOKAN_OPTION_MOUNT_MANAGER) &&
+  if (!(dokanOptions.Options & DOKAN_OPTION_MOUNT_MANAGER) &&
       wcscmp(MountPoint, L"") == 0) {
     fwprintf(stderr, L"Mount Point required.\n");
-    free(dokanOperations);
-    free(dokanOptions);
     return EXIT_FAILURE;
   }
 
-  if ((dokanOptions->Options & DOKAN_OPTION_MOUNT_MANAGER) &&
-      (dokanOptions->Options & DOKAN_OPTION_CURRENT_SESSION)) {
+  if ((dokanOptions.Options & DOKAN_OPTION_MOUNT_MANAGER) &&
+      (dokanOptions.Options & DOKAN_OPTION_CURRENT_SESSION)) {
     fwprintf(stderr,
              L"Mount Manager always mount the drive for all user sessions.\n");
-    free(dokanOperations);
-    free(dokanOptions);
     return EXIT_FAILURE;
   }
 
@@ -1477,50 +1707,57 @@ int __cdecl wmain(ULONG argc, PWCHAR argv[]) {
   // properly.
   g_HasSeSecurityPrivilege = AddSeSecurityNamePrivilege();
   if (!g_HasSeSecurityPrivilege) {
-    fwprintf(stderr, L"Failed to add security privilege to process\n");
     fwprintf(stderr,
-             L"\t=> GetFileSecurity/SetFileSecurity may not work properly\n");
-    fwprintf(stderr, L"\t=> Please restart mirror sample with administrator "
-                     L"rights to fix it\n");
+             L"[Mirror] Failed to add security privilege to process\n"
+             L"\t=> GetFileSecurity/SetFileSecurity may not work properly\n"
+             L"\t=> Please restart mirror sample with administrator rights to fix it\n");
+  }
+
+  if (g_ImpersonateCallerUser && !g_HasSeSecurityPrivilege) {
+    fwprintf(
+        stderr,
+        L"[Mirror] Impersonate Caller User requires administrator right to work properly\n"
+        L"\t=> Other users may not use the drive properly\n"
+        L"\t=> Please restart mirror sample with administrator rights to fix it\n");
   }
 
   if (g_DebugMode) {
-    dokanOptions->Options |= DOKAN_OPTION_DEBUG;
+    dokanOptions.Options |= DOKAN_OPTION_DEBUG;
   }
   if (g_UseStdErr) {
-    dokanOptions->Options |= DOKAN_OPTION_STDERR;
+    dokanOptions.Options |= DOKAN_OPTION_STDERR;
   }
 
-  dokanOptions->Options |= DOKAN_OPTION_ALT_STREAM;
+  dokanOptions.Options |= DOKAN_OPTION_ALT_STREAM;
 
-  ZeroMemory(dokanOperations, sizeof(DOKAN_OPERATIONS));
-  dokanOperations->ZwCreateFile = MirrorCreateFile;
-  dokanOperations->Cleanup = MirrorCleanup;
-  dokanOperations->CloseFile = MirrorCloseFile;
-  dokanOperations->ReadFile = MirrorReadFile;
-  dokanOperations->WriteFile = MirrorWriteFile;
-  dokanOperations->FlushFileBuffers = MirrorFlushFileBuffers;
-  dokanOperations->GetFileInformation = MirrorGetFileInformation;
-  dokanOperations->FindFiles = MirrorFindFiles;
-  dokanOperations->FindFilesWithPattern = NULL;
-  dokanOperations->SetFileAttributes = MirrorSetFileAttributes;
-  dokanOperations->SetFileTime = MirrorSetFileTime;
-  dokanOperations->DeleteFile = MirrorDeleteFile;
-  dokanOperations->DeleteDirectory = MirrorDeleteDirectory;
-  dokanOperations->MoveFile = MirrorMoveFile;
-  dokanOperations->SetEndOfFile = MirrorSetEndOfFile;
-  dokanOperations->SetAllocationSize = MirrorSetAllocationSize;
-  dokanOperations->LockFile = MirrorLockFile;
-  dokanOperations->UnlockFile = MirrorUnlockFile;
-  dokanOperations->GetFileSecurity = MirrorGetFileSecurity;
-  dokanOperations->SetFileSecurity = MirrorSetFileSecurity;
-  dokanOperations->GetDiskFreeSpace = NULL; // MirrorDokanGetDiskFreeSpace;
-  dokanOperations->GetVolumeInformation = MirrorGetVolumeInformation;
-  dokanOperations->Unmounted = MirrorUnmounted;
-  dokanOperations->FindStreams = MirrorFindStreams;
-  dokanOperations->Mounted = MirrorMounted;
+  ZeroMemory(&dokanOperations, sizeof(DOKAN_OPERATIONS));
+  dokanOperations.ZwCreateFile = MirrorCreateFile;
+  dokanOperations.Cleanup = MirrorCleanup;
+  dokanOperations.CloseFile = MirrorCloseFile;
+  dokanOperations.ReadFile = MirrorReadFile;
+  dokanOperations.WriteFile = MirrorWriteFile;
+  dokanOperations.FlushFileBuffers = MirrorFlushFileBuffers;
+  dokanOperations.GetFileInformation = MirrorGetFileInformation;
+  dokanOperations.FindFiles = MirrorFindFiles;
+  dokanOperations.FindFilesWithPattern = NULL;
+  dokanOperations.SetFileAttributes = MirrorSetFileAttributes;
+  dokanOperations.SetFileTime = MirrorSetFileTime;
+  dokanOperations.DeleteFile = MirrorDeleteFile;
+  dokanOperations.DeleteDirectory = MirrorDeleteDirectory;
+  dokanOperations.MoveFile = MirrorMoveFile;
+  dokanOperations.SetEndOfFile = MirrorSetEndOfFile;
+  dokanOperations.SetAllocationSize = MirrorSetAllocationSize;
+  dokanOperations.LockFile = MirrorLockFile;
+  dokanOperations.UnlockFile = MirrorUnlockFile;
+  dokanOperations.GetFileSecurity = MirrorGetFileSecurity;
+  dokanOperations.SetFileSecurity = MirrorSetFileSecurity;
+  dokanOperations.GetDiskFreeSpace = MirrorDokanGetDiskFreeSpace;
+  dokanOperations.GetVolumeInformation = MirrorGetVolumeInformation;
+  dokanOperations.Unmounted = MirrorUnmounted;
+  dokanOperations.FindStreams = MirrorFindStreams;
+  dokanOperations.Mounted = MirrorMounted;
 
-  status = DokanMain(dokanOptions, dokanOperations);
+  status = DokanMain(&dokanOptions, &dokanOperations);
   switch (status) {
   case DOKAN_SUCCESS:
     fprintf(stderr, "Success\n");
@@ -1550,8 +1787,5 @@ int __cdecl wmain(ULONG argc, PWCHAR argv[]) {
     fprintf(stderr, "Unknown error: %d\n", status);
     break;
   }
-
-  free(dokanOptions);
-  free(dokanOperations);
   return EXIT_SUCCESS;
 }

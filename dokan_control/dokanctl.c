@@ -1,7 +1,8 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2020 Google, Inc.
+  Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
   http://dokan-dev.github.io
@@ -31,7 +32,7 @@ THE SOFTWARE.
 
 #include "../dokan/dokan.h"
 #include "../dokan/dokanc.h"
-#include <Shlobj.h>
+#include <ShlObj.h>
 
 #define DOKAN_DRIVER_FULL_PATH                                                 \
   L"%SystemRoot%\\system32\\drivers\\dokan" DOKAN_MAJOR_API_VERSION L".sys"
@@ -46,15 +47,20 @@ int ShowUsage() {
           "\n"
           "Example:\n"
           "  /u M                : Unmount M: drive\n"
-          "  /u C:\\mount\\dokan : Unmount mount point C:\\mount\\dokan\n"
+          "  /u C:\\mount\\dokan   : Unmount mount point C:\\mount\\dokan\n"
           "  /u 1                : Unmount mount point 1\n"
           "  /i d                : Install driver\n"
           "  /i n                : Install network provider\n"
           "  /r d                : Remove driver\n"
           "  /r n                : Remove network provider\n"
           "  /l a                : List current mount points\n"
-          "  /d [0-9]            : Enable Kernel Debug output\n"
+          "  /d [0-7]            : Enable Kernel Debug output\n"
           "  /v                  : Print Dokan version\n");
+  return EXIT_FAILURE;
+}
+
+int DefaultCaseOption() {
+  fprintf(stderr, "Unknown option - Use /? to show usage\n");
   return EXIT_FAILURE;
 }
 
@@ -72,7 +78,7 @@ int Unmount(LPCWSTR MountPoint) {
 int InstallDriver(LPCWSTR driverFullPath) {
   fprintf(stdout, "Installing driver...\n");
   if (GetFileAttributes(driverFullPath) == INVALID_FILE_ATTRIBUTES) {
-    fwprintf(stderr, L"Error the file '%s' does not exist.\n", driverFullPath);
+    fwprintf(stderr, L"Error the file '%ls' does not exist.\n", driverFullPath);
     return EXIT_FAILURE;
   }
 
@@ -87,12 +93,12 @@ int InstallDriver(LPCWSTR driverFullPath) {
 }
 
 int DeleteDokanService(LPCWSTR ServiceName) {
-  fwprintf(stdout, L"Removing '%s'...\n", ServiceName);
+  fwprintf(stdout, L"Removing '%ls'...\n", ServiceName);
   if (!DokanServiceDelete(ServiceName)) {
-    fwprintf(stderr, L"Error removing '%s'\n", ServiceName);
+    fwprintf(stderr, L"Error removing '%ls'\n", ServiceName);
     return EXIT_FAILURE;
   }
-  fwprintf(stdout, L"'%s' removed.\n", ServiceName);
+  fwprintf(stdout, L"'%ls' removed.\n", ServiceName);
   return EXIT_SUCCESS;
 }
 
@@ -126,10 +132,10 @@ int __cdecl wmain(int argc, PWCHAR argv[]) {
 
   ExpandEnvironmentStringsW(DOKAN_DRIVER_FULL_PATH, driverFullPath, MAX_PATH);
 
-  fwprintf(stdout, L"Driver path: '%s'\n", driverFullPath);
+  fwprintf(stdout, L"Driver path: '%ls'\n", driverFullPath);
 
   WCHAR option = GetOption(argc, argv, 1);
-  if (option == L'\0') {
+  if (option == L'\0' || option == L'?') {
     return ShowUsage();
   }
 
@@ -146,12 +152,14 @@ int __cdecl wmain(int argc, PWCHAR argv[]) {
     if (type == L'd') {
       return InstallDriver(driverFullPath);
     } else if (type == L'n') {
-      if (DokanNetworkProviderInstall())
+      if (DokanNetworkProviderInstall()) {
         fprintf(stdout, "network provider install ok\n");
-      else
+      } else {
         fprintf(stderr, "network provider install failed\n");
+        return EXIT_FAILURE;
+      }
     } else {
-      goto DEFAULT;
+      return DefaultCaseOption();
     }
   } break;
 
@@ -162,67 +170,61 @@ int __cdecl wmain(int argc, PWCHAR argv[]) {
     } else if (type == L'n') {
       if (DokanNetworkProviderUninstall())
         fprintf(stdout, "network provider remove ok\n");
-      else
+      else {
         fprintf(stderr, "network provider remove failed\n");
+        return EXIT_FAILURE;
+      }
     } else {
-      goto DEFAULT;
+      return DefaultCaseOption();
     }
   } break;
 
   case L'd': {
     WCHAR type = towlower(argv[2][0]);
-    if (L'0' > type || type > L'9')
-      goto DEFAULT;
+    if (L'0' > type || type > L'7')
+      return DefaultCaseOption();
 
     ULONG mode = type - L'0';
     if (DokanSetDebugMode(mode)) {
       fprintf(stdout, "set debug mode ok\n");
     } else {
       fprintf(stderr, "set debug mode failed\n");
+      return EXIT_FAILURE;
     }
   } break;
 
   case L'u': {
     if (argc < 3) {
-      goto DEFAULT;
+      return DefaultCaseOption();
     }
     return Unmount(argv[2]);
-  } break;
+  }
 
   // No admin rights required
   case L'l': {
     ULONG nbRead = 0;
-    PDOKAN_CONTROL dokanControl =
-        malloc(DOKAN_MAX_INSTANCES * sizeof(*dokanControl));
+    PDOKAN_CONTROL dokanControl = DokanGetMountPointList(FALSE, &nbRead);
     if (dokanControl == NULL) {
-      fprintf(stderr, "Failed to allocate dokanControl\n");
+      fwprintf(stderr, L"  Cannot retrieve mount point list.\n");
       return EXIT_FAILURE;
     }
 
-    ZeroMemory(dokanControl, DOKAN_MAX_INSTANCES * sizeof(*dokanControl));
-    if (DokanGetMountPointList(dokanControl, DOKAN_MAX_INSTANCES, FALSE,
-                               &nbRead)) {
-      fwprintf(stdout, L"  Mount points: %d\n", nbRead);
-      for (unsigned int p = 0; p < nbRead; ++p) {
-        fwprintf(stdout, L"  %d# MountPoint: %s - UNC: %s - DeviceName: %s\n",
-                 p, dokanControl[p].MountPoint, dokanControl[p].UNCName,
-                 dokanControl[p].DeviceName);
-      }
-    } else {
-      fwprintf(stderr, L"  Cannot retrieve mount point list.\n");
-    }
-    free(dokanControl);
+    fwprintf(stdout, L"  Mount points: %lu\n", nbRead);
+    for (ULONG p = 0; p < nbRead; ++p)
+      fwprintf(stdout, L"  %lu# MountPoint: %ls - UNC: %ls - DeviceName: %ls\n", p,
+               dokanControl[p].MountPoint, dokanControl[p].UNCName,
+               dokanControl[p].DeviceName);
+    DokanReleaseMountPointList(dokanControl);
   } break;
 
   case L'v': {
     fprintf(stdout, "dokanctl : %s %s\n", __DATE__, __TIME__);
-    fprintf(stdout, "Dokan version : %d\n", DokanVersion());
+    fprintf(stdout, "Dokan version : %ld\n", DokanVersion());
     fprintf(stdout, "Dokan driver version : 0x%lx\n", DokanDriverVersion());
   } break;
 
-  DEFAULT:
   default:
-    fprintf(stderr, "Unknown option - Use /? to show usage\n");
+    return DefaultCaseOption();
   }
 
   return EXIT_SUCCESS;

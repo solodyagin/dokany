@@ -20,5 +20,10 @@ DokanUseStdErr
 DokanDebugMode
 DokanMapKernelToUserCreateFileFlags
 DokanGetMountPointList
+DokanReleaseMountPointList
 DokanNtStatusFromWin32
-DokanMapStandardToGenericAccess
+DokanNotifyCreate
+DokanNotifyDelete
+DokanNotifyUpdate
+DokanNotifyXAttrUpdate
+DokanNotifyRename

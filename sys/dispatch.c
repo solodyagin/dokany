@@ -1,7 +1,8 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2017 - 2020 Google, Inc.
+  Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
   http://dokan-dev.github.io
@@ -61,6 +62,55 @@ DokanBuildRequest(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
   }
 
   return Status;
+}
+
+VOID
+DokanCancelCreateIrp(__in PDEVICE_OBJECT DeviceObject,
+                     __in PIRP_ENTRY IrpEntry,
+                     __in NTSTATUS Status) {
+  BOOLEAN AtIrqlPassiveLevel = FALSE;
+  BOOLEAN IsTopLevelIrp = FALSE;
+  PIRP Irp = IrpEntry->Irp;
+  PEVENT_INFORMATION eventInfo = NULL;
+
+  __try {
+
+    __try {
+
+      AtIrqlPassiveLevel = (KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+      if (AtIrqlPassiveLevel) {
+        FsRtlEnterFileSystem();
+      }
+
+      if (!IoGetTopLevelIrp()) {
+        IsTopLevelIrp = TRUE;
+        IoSetTopLevelIrp(Irp);
+      }
+
+      eventInfo = DokanAllocZero(sizeof(EVENT_INFORMATION));
+      eventInfo->Status = Status;
+      DokanCompleteCreate(IrpEntry, eventInfo);
+
+    } __except (DokanExceptionFilter(Irp, GetExceptionInformation())) {
+
+      DokanExceptionHandler(DeviceObject, Irp, GetExceptionCode());
+    }
+
+  } __finally {
+
+    if (eventInfo != NULL) {
+      ExFreePool(eventInfo);
+    }
+
+    if (IsTopLevelIrp) {
+      IoSetTopLevelIrp(NULL);
+    }
+
+    if (AtIrqlPassiveLevel) {
+      FsRtlExitFileSystem();
+    }
+  }
 }
 
 NTSTATUS
@@ -147,6 +197,10 @@ DokanDispatchRequest(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
     return DokanDispatchCleanup(DeviceObject, Irp);
 
   case IRP_MJ_SHUTDOWN:
+    // A driver does not receive an IRP_MJ_SHUTDOWN request for a device object
+    // unless it registers to do so with either IoRegisterShutdownNotification
+    // or IoRegisterLastChanceShutdownNotification.
+    // We do not call those functions and therefore should not get the IRP
     return DokanDispatchShutdown(DeviceObject, Irp);
 
   case IRP_MJ_QUERY_SECURITY:
@@ -155,10 +209,9 @@ DokanDispatchRequest(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
   case IRP_MJ_SET_SECURITY:
     return DokanDispatchSetSecurity(DeviceObject, Irp);
 
-#if (_WIN32_WINNT >= 0x0500)
   case IRP_MJ_PNP:
     return DokanDispatchPnp(DeviceObject, Irp);
-#endif //(_WIN32_WINNT >= 0x0500)
+
   default:
     DDbgPrint("DokanDispatchRequest: Unexpected major function: %xh\n",
               irpSp->MajorFunction);

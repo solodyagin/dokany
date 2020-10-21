@@ -1,7 +1,8 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2017 - 2018 Google, Inc.
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
   http://dokan-dev.github.io
@@ -24,13 +25,14 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 
 #ifndef DOKAN_MAJOR_API_VERSION
 #define DOKAN_MAJOR_API_VERSION L"1"
+#include <minwindef.h>
 #endif
 
 #define DOKAN_DRIVER_VERSION 0x0000190
 
 #define EVENT_CONTEXT_MAX_SIZE (1024 * 32)
 
-#define IOCTL_TEST                                                             \
+#define IOCTL_GET_VERSION                                                      \
   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define IOCTL_SET_DEBUG_MODE                                                   \
@@ -66,6 +68,23 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 #define IOCTL_EVENT_MOUNTPOINT_LIST                                            \
   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80D, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+#define IOCTL_MOUNTPOINT_CLEANUP                                               \
+  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80E, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// DeviceIoControl code to send to a keepalive handle to activate it (see the
+// documentation for the keepalive flags in the DokanFCB struct).
+#define FSCTL_ACTIVATE_KEEPALIVE                                               \
+  CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x80F, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// DeviceIoControl code to send path notification request.
+#define FSCTL_NOTIFY_PATH                                                      \
+  CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// DeviceIoControl code to retrieve the VOLUME_METRICS struct for the targeted
+// volume.
+#define IOCTL_GET_VOLUME_METRICS                                               \
+  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 #define DRIVER_FUNC_INSTALL 0x01
 #define DRIVER_FUNC_REMOVE 0x02
 
@@ -89,10 +108,22 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 #define DOKAN_SYNCHRONOUS_IO 64
 #define DOKAN_WRITE_TO_END_OF_FILE 128
 #define DOKAN_NOCACHE 256
+#define DOKAN_RETRY_CREATE 512
+#define DOKAN_FILE_CHANGE_LAST_WRITE 1024
 
 // used in DOKAN_START->DeviceType
 #define DOKAN_DISK_FILE_SYSTEM 0
 #define DOKAN_NETWORK_FILE_SYSTEM 1
+
+// Special files that are tagged for specfic FS purpose when their FCB is init.
+// Note: This file names can no longer be used by userland FS correctly.
+#define DOKAN_KEEPALIVE_FILE_NAME L"\\__drive_fs_keepalive"
+#define DOKAN_NOTIFICATION_FILE_NAME L"\\drive_fs_notification"
+
+// The minimum FCB garbage collection interval, below which the parameter is
+// ignored (instantaneous deletion with an interval of 0 is more efficient than
+// using the machinery with a tight interval).
+#define MIN_FCB_GARBAGE_COLLECTION_INTERVAL 500
 
 /*
  * This structure is used for copying UNICODE_STRING from the kernel mode driver
@@ -104,6 +135,20 @@ typedef struct _DOKAN_UNICODE_STRING_INTERMEDIATE {
   USHORT MaximumLength;
   WCHAR Buffer[1];
 } DOKAN_UNICODE_STRING_INTERMEDIATE, *PDOKAN_UNICODE_STRING_INTERMEDIATE;
+
+/*
+ * This structure is used for sending notify path information from the user mode
+ * driver to the kernel mode driver. See below links for parameter details for
+ * CompletionFilter and Action, and FsRtlNotifyFullReportChange call.
+ * https://msdn.microsoft.com/en-us/library/windows/hardware/ff547026(v=vs.85).aspx
+ * https://msdn.microsoft.com/en-us/library/windows/hardware/ff547041(v=vs.85).aspx
+ */
+typedef struct _DOKAN_NOTIFY_PATH_INTERMEDIATE {
+  ULONG CompletionFilter;
+  ULONG Action;
+  USHORT Length;
+  WCHAR Buffer[1];
+} DOKAN_NOTIFY_PATH_INTERMEDIATE, *PDOKAN_NOTIFY_PATH_INTERMEDIATE;
 
 /*
  * This structure is used for copying ACCESS_STATE from the kernel mode driver
@@ -296,6 +341,21 @@ typedef struct _EVENT_CONTEXT {
   } Operation;
 } EVENT_CONTEXT, *PEVENT_CONTEXT;
 
+// The output from IOCTL_GET_VOLUME_METRICS.
+typedef struct _VOLUME_METRICS {
+  ULONG64 NormalFcbGarbageCollectionCycles;
+  // A "cycle" can consist of multiple "passes".
+  ULONG64 NormalFcbGarbageCollectionPasses;
+  ULONG64 ForcedFcbGarbageCollectionPasses;
+  ULONG64 FcbAllocations;
+  ULONG64 FcbDeletions;
+  // A "cancellation" is when a single FCB's garbage collection gets canceled.
+  ULONG64 FcbGarbageCollectionCancellations;
+  // Number of IRPs with a too large buffer that could not be registered for
+  // being forward to userland.
+  ULONG64 LargeIRPRegistrationCanceled;
+} VOLUME_METRICS, *PVOLUME_METRICS;
+
 #define WRITE_MAX_SIZE                                                         \
   (EVENT_CONTEXT_MAX_SIZE - sizeof(EVENT_CONTEXT) - 256 * sizeof(WCHAR))
 
@@ -333,12 +393,29 @@ typedef struct _EVENT_INFORMATION {
 
 } EVENT_INFORMATION, *PEVENT_INFORMATION;
 
-#define DOKAN_EVENT_ALTERNATIVE_STREAM_ON 1
-#define DOKAN_EVENT_WRITE_PROTECT 2
-#define DOKAN_EVENT_REMOVABLE 4
-#define DOKAN_EVENT_MOUNT_MANAGER 8
-#define DOKAN_EVENT_CURRENT_SESSION 16
-#define DOKAN_EVENT_FILELOCK_USER_MODE 32
+// Dokan mount options
+#define DOKAN_EVENT_ALTERNATIVE_STREAM_ON                           1
+#define DOKAN_EVENT_WRITE_PROTECT                                   (1 << 1)
+#define DOKAN_EVENT_REMOVABLE                                       (1 << 2)
+#define DOKAN_EVENT_MOUNT_MANAGER                                   (1 << 3)
+#define DOKAN_EVENT_CURRENT_SESSION                                 (1 << 4)
+#define DOKAN_EVENT_FILELOCK_USER_MODE                              (1 << 5)
+// Whether any oplock functionality should be disabled.
+#define DOKAN_EVENT_DISABLE_OPLOCKS                                 (1 << 6)
+#define DOKAN_EVENT_ENABLE_FCB_GC                                   (1 << 7)
+// CaseSenitive FileName: NTFS can look to be case-insensitive
+// but in some situation it can also be case-sensitive :
+// * NTFS keep the filename casing used during Create internally.
+// * Open "MyFile" on NTFS can open "MYFILE" if it exists.
+// * FILE_FLAG_POSIX_SEMANTICS (IRP_MJ_CREATE: SL_CASE_SENSITIVE)
+//   can be used during Create to make the lookup case-sensitive.
+// * Since Win10, NTFS can have specific directories
+//   case-sensitive / insensitive, even if the device tags says otherwise.
+// Dokan choose to support case-sensitive or case-insensitive filesystem
+// but not those NTFS specific scenarios.
+#define DOKAN_EVENT_CASE_SENSITIVE                                  (1 << 8)
+// Enables unmounting of network drives via file explorer
+#define DOKAN_EVENT_ENABLE_NETWORK_UNMOUNT                           (1 << 9)
 
 typedef struct _EVENT_DRIVER_INFO {
   ULONG DriverVersion;
@@ -357,16 +434,59 @@ typedef struct _EVENT_START {
   ULONG IrpTimeout;
 } EVENT_START, *PEVENT_START;
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4201)
+#endif
 typedef struct _DOKAN_RENAME_INFORMATION {
-  BOOLEAN ReplaceIfExists;
+#if (_WIN32_WINNT >= _WIN32_WINNT_WIN10_RS1)
+	union {
+		BOOLEAN ReplaceIfExists;  // FileRenameInformation
+		ULONG Flags;              // FileRenameInformationEx
+	} DUMMYUNIONNAME;
+#else
+	BOOLEAN ReplaceIfExists;
+#endif
   ULONG FileNameLength;
   WCHAR FileName[1];
 } DOKAN_RENAME_INFORMATION, *PDOKAN_RENAME_INFORMATION;
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 typedef struct _DOKAN_LINK_INFORMATION {
   BOOLEAN ReplaceIfExists;
   ULONG FileNameLength;
   WCHAR FileName[1];
 } DOKAN_LINK_INFORMATION, *PDOKAN_LINK_INFORMATION;
+
+/**
+* \struct DOKAN_CONTROL
+* \brief Dokan Control
+*/
+typedef struct _DOKAN_CONTROL {
+  /** File System Type */
+  ULONG Type;
+  /** Mount point. Can be "M:\" (drive letter) or "C:\mount\dokan" (path in NTFS) */
+  WCHAR MountPoint[MAX_PATH];
+  /** UNC name used for network volume */
+  WCHAR UNCName[64];
+  /** Disk Device Name */
+  WCHAR DeviceName[64];
+#ifdef _MSC_VER
+  /**
+  * Volume Device Object. The value is always 0
+  * and should be removed from the public DOKAN_CONTROL.
+  * MinGW also do not support PVOID64 so we convert it to ULONG64 see #902.
+  */
+  PVOID64 VolumeDeviceObject;
+#else
+  ULONG64 VolumeDeviceObject;
+#endif
+  /** Session ID of calling process */
+  ULONG SessionId;
+  /** Contains information about the flags on the mount */
+  ULONG MountOptions;
+} DOKAN_CONTROL, *PDOKAN_CONTROL;
 
 #endif // PUBLIC_H_

@@ -1,7 +1,7 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
   http://dokan-dev.github.io
@@ -95,6 +95,8 @@ typedef struct _DOKAN_OPEN_INFO {
   PLIST_ENTRY DirListHead;
   /** File streams list. Used by FindStreams */
   PLIST_ENTRY StreamListHead;
+  /** Used when dispatching the close once the OpenCount drops to 0 **/
+  LPWSTR FileName;
 } DOKAN_OPEN_INFO, *PDOKAN_OPEN_INFO;
 
 BOOL DokanStart(PDOKAN_INSTANCE Instance);
@@ -103,7 +105,7 @@ BOOL SendToDevice(LPCWSTR DeviceName, DWORD IoControlCode, PVOID InputBuffer,
                   ULONG InputLength, PVOID OutputBuffer, ULONG OutputLength,
                   PULONG ReturnedLength);
 
-LPWSTR
+VOID
 GetRawDeviceName(LPCWSTR DeviceName, LPWSTR DestinationBuffer,
                  rsize_t DestinationBufferSizeInElements);
 
@@ -117,7 +119,9 @@ BOOL DokanMount(LPCWSTR MountPoint, LPCWSTR DeviceName,
 BOOL IsMountPointDriveLetter(LPCWSTR mountPoint);
 
 VOID SendEventInformation(HANDLE Handle, PEVENT_INFORMATION EventInfo,
-                          ULONG EventLength, PDOKAN_INSTANCE DokanInstance);
+                          ULONG EventLength);
+
+ULONG DispatchGetEventInformationLength(ULONG bufferSize);
 
 PEVENT_INFORMATION
 DispatchCommon(PEVENT_CONTEXT EventContext, ULONG SizeOfEventInfo,
@@ -194,7 +198,23 @@ PDOKAN_OPEN_INFO
 GetDokanOpenInfo(PEVENT_CONTEXT EventInfomation, PDOKAN_INSTANCE DokanInstance);
 
 VOID ReleaseDokanOpenInfo(PEVENT_INFORMATION EventInfomation,
+                          PDOKAN_FILE_INFO FileInfo,
                           PDOKAN_INSTANCE DokanInstance);
+
+/**
+ * \brief Unmount a Dokan device from a mount point
+ *
+ * Same as \ref DokanRemoveMountPoint
+ * If Safe is \c TRUE, it will broadcast to all desktops and Shells
+ * Safe should not be used during DLL_PROCESS_DETACH
+ *
+ * \see DokanRemoveMountPoint
+ *
+ * \param MountPoint Mount point to unmount ("Z", "Z:", "Z:\", "Z:\MyMountPoint").
+ * \param Safe Process is not in DLL_PROCESS_DETACH state.
+ * \return \c TRUE if device was unmounted or \c FALSE in case of failure or device not found.
+ */
+BOOL DokanRemoveMountPointEx(LPCWSTR MountPoint, BOOL Safe);
 
 #ifdef __cplusplus
 }

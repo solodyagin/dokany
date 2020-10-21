@@ -1,7 +1,8 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2020 Google, Inc.
+  Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
   http://dokan-dev.github.io
@@ -44,7 +45,7 @@ extern "C" {
 
 #define DOKAN_KEEPALIVE_TIME 3000 // in miliseconds
 
-#define DOKAN_MAX_THREAD 15
+#define DOKAN_MAX_THREAD 63
 
 // DokanOptions->DebugMode is ON?
 extern BOOL g_DebugMode;
@@ -52,22 +53,21 @@ extern BOOL g_DebugMode;
 // DokanOptions->UseStdErr is ON?
 extern BOOL g_UseStdErr;
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) || (defined(__GNUC__) && !defined(__CYGWIN__))
 
 static VOID DokanDbgPrint(LPCSTR format, ...) {
-  const char *outputString;
-  char *buffer;
-  size_t length;
+  const char *outputString = format; // fallback
+  char *buffer = NULL;
+  int length;
   va_list argp;
 
   va_start(argp, format);
   length = _vscprintf(format, argp) + 1;
-  buffer = (char *)_malloca(length * sizeof(char));
-  if (buffer) {
-    vsprintf_s(buffer, length, format, argp);
+  if ((length - 1) != -1) {
+    buffer = (char *)_malloca(length * sizeof(char));
+  }
+  if (buffer && vsprintf_s(buffer, length, format, argp) != -1) {
     outputString = buffer;
-  } else {
-    outputString = format;
   }
   if (g_UseStdErr)
     fputs(outputString, stderr);
@@ -81,19 +81,18 @@ static VOID DokanDbgPrint(LPCSTR format, ...) {
 }
 
 static VOID DokanDbgPrintW(LPCWSTR format, ...) {
-  const WCHAR *outputString;
-  WCHAR *buffer;
-  size_t length;
+  const WCHAR *outputString = format; // fallback
+  WCHAR *buffer = NULL;
+  int length;
   va_list argp;
 
   va_start(argp, format);
   length = _vscwprintf(format, argp) + 1;
-  buffer = (WCHAR *)_malloca(length * sizeof(WCHAR));
-  if (buffer) {
-    vswprintf_s(buffer, length, format, argp);
+  if ((length - 1) != -1) {
+    buffer = (WCHAR *)_malloca(length * sizeof(WCHAR));
+  }
+  if (buffer && vswprintf_s(buffer, length, format, argp) != -1) {
     outputString = buffer;
-  } else {
-    outputString = format;
   }
   if (g_UseStdErr)
     fputws(outputString, stderr);
@@ -103,6 +102,8 @@ static VOID DokanDbgPrintW(LPCWSTR format, ...) {
     _freea(buffer);
   va_end(argp);
 }
+
+#if defined(_MSC_VER)
 
 #define DbgPrint(format, ...)                                                  \
   do {                                                                         \
@@ -122,7 +123,29 @@ static VOID DokanDbgPrintW(LPCWSTR format, ...) {
   __pragma(warning(push)) __pragma(warning(disable : 4127)) while (0)          \
       __pragma(warning(pop))
 
-#endif // MSVC
+#endif // defined(_MSC_VER)
+
+#if defined(__GNUC__)
+
+#define DbgPrint(format, ...)                                                  \
+  do {                                                                         \
+    if (g_DebugMode) {                                                         \
+      DokanDbgPrint(format, ##__VA_ARGS__);                                    \
+    }                                                                          \
+  } while (0)
+
+#define DbgPrintW(format, ...)                                                 \
+  do {                                                                         \
+    if (g_DebugMode) {                                                         \
+      DokanDbgPrintW(format, ##__VA_ARGS__);                                   \
+    }                                                                          \
+  } while (0)
+
+#endif // defined(__GNUC__)
+
+#endif // defined(_MSC_VER) || (defined(__GNUC__) && !defined(__CYGWIN__))
+
+#define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 
 VOID DOKANAPI DokanUseStdErr(BOOL Status);
 
@@ -138,6 +161,8 @@ BOOL DOKANAPI DokanNetworkProviderInstall();
 BOOL DOKANAPI DokanNetworkProviderUninstall();
 
 BOOL DOKANAPI DokanSetDebugMode(ULONG Mode);
+
+BOOL DOKANAPI DokanMountPointsCleanUp();
 
 #ifdef __cplusplus
 }

@@ -1,7 +1,8 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2020 Google, Inc.
+  Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
   http://dokan-dev.github.io
@@ -20,8 +21,8 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 */
 
 #include "dokani.h"
-#include <Dbt.h>
-#include <Shlobj.h>
+#include <dbt.h>
+#include <shlobj.h>
 #include <stdio.h>
 
 #pragma warning(push)
@@ -254,7 +255,7 @@ BOOL DOKANAPI DokanServiceDelete(LPCWSTR ServiceName) {
 }
 
 BOOL DOKANAPI DokanUnmount(WCHAR DriveLetter) {
-  WCHAR mountPoint[] = L"M:";
+  WCHAR mountPoint[MAX_PATH] = L"M:";
   mountPoint[0] = DriveLetter;
   return DokanRemoveMountPoint(mountPoint);
 }
@@ -264,6 +265,7 @@ BOOL DOKANAPI DokanUnmount(WCHAR DriveLetter) {
 #define DOKAN_NP_DEVICE_NAME                                                   \
   L"\\Device\\DokanRedirector" DOKAN_MAJOR_API_VERSION
 #define DOKAN_NP_NAME L"Dokan" DOKAN_MAJOR_API_VERSION
+#define DOKAN_NP_PATH L"System32\\dokannp" DOKAN_MAJOR_API_VERSION L".dll"
 #define DOKAN_BINARY_NAME L"dokannp" DOKAN_MAJOR_API_VERSION L".dll"
 #define DOKAN_NP_ORDER_KEY                                                     \
   L"System\\CurrentControlSet\\Control\\NetworkProvider\\Order"
@@ -275,31 +277,16 @@ BOOL DOKANAPI DokanNetworkProviderInstall() {
   WCHAR commanp[64];
   WCHAR buffer[1024];
   DWORD buffer_size = sizeof(buffer);
-  WCHAR pBuf[MAX_PATH];
 
   ZeroMemory(&buffer, sizeof(buffer));
   ZeroMemory(commanp, sizeof(commanp));
 
-  int length = GetModuleFileName(NULL, pBuf, MAX_PATH);
-  if (length == 0) {
-    DokanDbgPrintW(
-        L"DokanNetworkProviderInstall: GetModuleFileName failed %d\n",
-        GetLastError());
+  if (RegCreateKeyEx(HKEY_LOCAL_MACHINE,
+                     DOKAN_NP_SERVICE_KEY L"\\NetworkProvider", 0, NULL,
+                     REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &key,
+                     &position) != ERROR_SUCCESS) {
     return FALSE;
   }
-
-  while (length >= 0 && pBuf[length] != '\\')
-    pBuf[length--] = '\0';
-  wcscat_s(pBuf, sizeof(pBuf) / sizeof(WCHAR), DOKAN_BINARY_NAME);
-
-  if (GetFileAttributes(pBuf) == INVALID_FILE_ATTRIBUTES) {
-    DokanDbgPrintW(L"Error the file '%s' does not exist.\n", pBuf);
-    return FALSE;
-  }
-
-  RegCreateKeyEx(HKEY_LOCAL_MACHINE, DOKAN_NP_SERVICE_KEY L"\\NetworkProvider",
-                 0, NULL, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS, NULL, &key,
-                 &position);
 
   RegSetValueEx(key, L"DeviceName", 0, REG_SZ, (BYTE *)DOKAN_NP_DEVICE_NAME,
                 (DWORD)(wcslen(DOKAN_NP_DEVICE_NAME) + 1) * sizeof(WCHAR));
@@ -307,23 +294,32 @@ BOOL DOKANAPI DokanNetworkProviderInstall() {
   RegSetValueEx(key, L"Name", 0, REG_SZ, (BYTE *)DOKAN_NP_NAME,
                 (DWORD)(wcslen(DOKAN_NP_NAME) + 1) * sizeof(WCHAR));
 
-  RegSetValueEx(key, L"ProviderPath", 0, REG_SZ, (BYTE *)pBuf,
-                (DWORD)(wcslen(pBuf) + 1) * sizeof(WCHAR));
+  RegSetValueEx(key, L"ProviderPath", 0, REG_SZ, (BYTE *)DOKAN_NP_PATH,
+                (DWORD)(wcslen(DOKAN_NP_PATH) + 1) * sizeof(WCHAR));
 
   RegCloseKey(key);
 
-  RegOpenKeyEx(HKEY_LOCAL_MACHINE, DOKAN_NP_ORDER_KEY, 0, KEY_ALL_ACCESS, &key);
+  if (RegOpenKeyEx(HKEY_LOCAL_MACHINE, DOKAN_NP_ORDER_KEY, 0, KEY_ALL_ACCESS,
+                   &key) != ERROR_SUCCESS) {
+    return FALSE;
+  }
+  
 
-  RegQueryValueEx(key, L"ProviderOrder", 0, &type, (BYTE *)&buffer,
-                  &buffer_size);
+  if (RegQueryValueEx(key, L"ProviderOrder", 0, &type, (BYTE *)&buffer,
+                      &buffer_size) != ERROR_SUCCESS) {
+    return FALSE;
+  }
 
   wcscat_s(commanp, sizeof(commanp) / sizeof(WCHAR), L",");
   wcscat_s(commanp, sizeof(commanp) / sizeof(WCHAR), DOKAN_NP_NAME);
 
   if (wcsstr(buffer, commanp) == NULL) {
     wcscat_s(buffer, sizeof(buffer) / sizeof(WCHAR), commanp);
-    RegSetValueEx(key, L"ProviderOrder", 0, REG_SZ, (BYTE *)&buffer,
-                  (DWORD)(wcslen(buffer) + 1) * sizeof(WCHAR));
+    if (RegSetValueEx(key, L"ProviderOrder", 0, REG_SZ, (BYTE *)&buffer,
+                      (DWORD)(wcslen(buffer) + 1) * sizeof(WCHAR))
+            != ERROR_SUCCESS) {
+      return FALSE;
+    }
   }
 
   RegCloseKey(key);
@@ -356,17 +352,15 @@ BOOL DOKANAPI DokanNetworkProviderUninstall() {
   wcscat_s(commanp, sizeof(commanp) / sizeof(WCHAR), L",");
   wcscat_s(commanp, sizeof(commanp) / sizeof(WCHAR), DOKAN_NP_NAME);
 
-  if (wcsstr(buffer, commanp) != NULL) {
-    WCHAR *dokan_pos = wcsstr(buffer, commanp);
-    if (dokan_pos == NULL)
-      return FALSE;
-    wcsncpy_s(buffer2, sizeof(buffer2) / sizeof(WCHAR), buffer,
-              dokan_pos - buffer);
-    wcscat_s(buffer2, sizeof(buffer2) / sizeof(WCHAR),
-             dokan_pos + wcslen(commanp));
-    RegSetValueEx(key, L"ProviderOrder", 0, REG_SZ, (BYTE *)&buffer2,
-                  (DWORD)(wcslen(buffer2) + 1) * sizeof(WCHAR));
-  }
+  WCHAR *dokan_pos = wcsstr(buffer, commanp);
+  if (dokan_pos == NULL)
+    return TRUE;
+  wcsncpy_s(buffer2, sizeof(buffer2) / sizeof(WCHAR), buffer,
+            dokan_pos - buffer);
+  wcscat_s(buffer2, sizeof(buffer2) / sizeof(WCHAR),
+           dokan_pos + wcslen(commanp));
+  RegSetValueEx(key, L"ProviderOrder", 0, REG_SZ, (BYTE *)&buffer2,
+                (DWORD)(wcslen(buffer2) + 1) * sizeof(WCHAR));
 
   RegCloseKey(key);
 
@@ -381,6 +375,7 @@ BOOL CreateMountPoint(LPCWSTR MountPoint, LPCWSTR DeviceName) {
   BOOL result;
   ULONG resultLength;
   WCHAR targetDeviceName[MAX_PATH];
+  WCHAR errorMsg[256];
 
   ZeroMemory(targetDeviceName, sizeof(targetDeviceName));
   wcscat_s(targetDeviceName, MAX_PATH, L"\\??");
@@ -392,7 +387,11 @@ BOOL CreateMountPoint(LPCWSTR MountPoint, LPCWSTR DeviceName) {
                       NULL);
 
   if (handle == INVALID_HANDLE_VALUE) {
-    DbgPrintW(L"CreateFile failed: %s (%d)\n", MountPoint, GetLastError());
+    FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, NULL, GetLastError(),
+                  MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), errorMsg, 256,
+                  NULL);
+    DbgPrintW(L"Use %s as mount point failed: (%d) %s", MountPoint,
+              GetLastError(), errorMsg);
     return FALSE;
   }
 
@@ -432,8 +431,11 @@ BOOL CreateMountPoint(LPCWSTR MountPoint, LPCWSTR DeviceName) {
     DbgPrintW(L"CreateMountPoint %s -> %s success\n", MountPoint,
               targetDeviceName);
   } else {
-    DbgPrintW(L"CreateMountPoint %s -> %s failed: %d\n", MountPoint,
-              targetDeviceName, GetLastError());
+    FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, NULL, GetLastError(),
+                  MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), errorMsg, 256,
+                  NULL);
+    DbgPrintW(L"CreateMountPoint %s -> %s failed: (%d) %s", MountPoint,
+              targetDeviceName, GetLastError(), errorMsg);
   }
   return result;
 }
@@ -443,6 +445,7 @@ BOOL DeleteMountPoint(LPCWSTR MountPoint) {
   BOOL result;
   ULONG resultLength;
   REPARSE_GUID_DATA_BUFFER reparseData = {0};
+  WCHAR errorMsg[256];
 
   handle = CreateFile(MountPoint, GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
                       FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
@@ -464,7 +467,16 @@ BOOL DeleteMountPoint(LPCWSTR MountPoint) {
   if (result) {
     DbgPrintW(L"DeleteMountPoint %s success\n", MountPoint);
   } else {
-    DbgPrintW(L"DeleteMountPoint %s failed: %d\n", MountPoint, GetLastError());
+    if (GetLastError() == ERROR_NOT_A_REPARSE_POINT) {
+      // Not a failure for us as this happen when mount manager
+      // is used and reparse point is removed from kernel.
+      return TRUE;
+    }
+    FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM, NULL, GetLastError(),
+                  MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), errorMsg, 256,
+                  NULL);
+    DbgPrintW(L"DeleteMountPoint %s failed: (%d) %s", MountPoint,
+              GetLastError(), errorMsg);
   }
   return result;
 }
@@ -540,11 +552,10 @@ BOOL DokanMount(LPCWSTR MountPoint, LPCWSTR DeviceName,
   UNREFERENCED_PARAMETER(DokanOptions);
   if (MountPoint != NULL) {
     if (!IsMountPointDriveLetter(MountPoint)) {
-      // Unfortunately mount manager is not working as excepted and don't
-      // support mount folder on associated IOCTL, which breaks dokan (ghost
-      // drive, ...)
-      // In that case we cannot use mount manager ; doesn't this should be done
-      // kernel-mode too?
+      if (DokanOptions->Options & DOKAN_OPTION_MOUNT_MANAGER) {
+        return TRUE; // Kernel has already created the reparse point.
+      }
+      // Should it not also be moved to kernel ?
       return CreateMountPoint(MountPoint, DeviceName);
     } else {
       // Notify applications / explorer
@@ -554,7 +565,7 @@ BOOL DokanMount(LPCWSTR MountPoint, LPCWSTR DeviceName,
   return TRUE;
 }
 
-BOOL DOKANAPI DokanRemoveMountPointEx(LPCWSTR MountPoint, BOOL Safe) {
+BOOL DokanRemoveMountPointEx(LPCWSTR MountPoint, BOOL Safe) {
   if (MountPoint != NULL) {
     size_t length = wcslen(MountPoint);
     if (length > 0) {
@@ -572,12 +583,8 @@ BOOL DOKANAPI DokanRemoveMountPointEx(LPCWSTR MountPoint, BOOL Safe) {
 
       if (SendGlobalReleaseIRP(mountPoint)) {
         if (!IsMountPointDriveLetter(MountPoint)) {
-          length = wcslen(mountPoint);
-          if (length + 1 < MAX_PATH) {
-            mountPoint[length] = L'\\';
-            mountPoint[length + 1] = L'\0';
-            DeleteMountPoint(mountPoint);
-          }
+          wcscat_s(mountPoint, sizeof(mountPoint) / sizeof(WCHAR), L"\\");
+          return DeleteMountPoint(mountPoint);
         } else {
           // Notify applications / explorer
           DokanBroadcastLink(MountPoint[0], TRUE, Safe);

@@ -1,7 +1,8 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2017 - 2020 Google, Inc.
+  Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
   http://dokan-dev.github.io
@@ -20,11 +21,95 @@ with this program. If not, see <http://www.gnu.org/licenses/>.
 */
 
 #include "dokan.h"
+#include "util/fcb.h"
+#include "util/mountmgr.h"
+#include "util/irp_buffer_helper.h"
+#include "util/str.h"
+
 #include <wdmsec.h>
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, DokanOplockRequest)
 #endif
+#include <mountdev.h>
+
+const WCHAR* DokanGetOplockControlCodeName(ULONG FsControlCode) {
+  switch (FsControlCode) {
+    case FSCTL_REQUEST_OPLOCK:
+      return L"FSCTL_REQUEST_OPLOCK";
+    case FSCTL_REQUEST_OPLOCK_LEVEL_1:
+      return L"FSCTL_REQUEST_OPLOCK_LEVEL_1";
+    case FSCTL_REQUEST_OPLOCK_LEVEL_2:
+      return L"FSCTL_REQUEST_OPLOCK_LEVEL_2";
+    case FSCTL_REQUEST_BATCH_OPLOCK:
+      return L"FSCTL_REQUEST_BATCH_OPLOCK";
+    case FSCTL_REQUEST_FILTER_OPLOCK:
+      return L"FSCTL_REQUEST_FILTER_OPLOCK";
+    case FSCTL_OPLOCK_BREAK_ACKNOWLEDGE:
+      return L"FSCTL_OPLOCK_BREAK_ACKNOWLEDGE";
+    case FSCTL_OPBATCH_ACK_CLOSE_PENDING:
+      return L"FSCTL_OPBATCH_ACK_CLOSE_PENDING";
+    case FSCTL_OPLOCK_BREAK_NOTIFY:
+      return L"FSCTL_OPLOCK_BREAK_NOTIFY";
+    case FSCTL_OPLOCK_BREAK_ACK_NO_2:
+      return L"FSCTL_OPLOCK_BREAK_ACK_NO_2";
+    default:
+      return L"<unknown>";
+  }
+}
+
+void DokanMaybeLogOplockRequest(__in PDOKAN_LOGGER Logger,
+                                __in PDokanFCB Fcb,
+                                __in ULONG FsControlCode,
+                                __in ULONG OplockCount,
+                                __in BOOLEAN AcquiredFcb,
+                                __in BOOLEAN AcquiredVcb,
+                                __in ULONG RequestedLevel,
+                                __in ULONG Flags) {
+  // These calls log to the fixed-size DokanOlockDebugInfo and not to a file, so
+  // we enable them no matter what.
+  OplockDebugRecordRequest(Fcb, FsControlCode, RequestedLevel);
+  if (Flags & REQUEST_OPLOCK_INPUT_FLAG_ACK) {
+    OplockDebugRecordFlag(Fcb, DOKAN_OPLOCK_DEBUG_GENERIC_ACKNOWLEDGEMENT);
+  }
+  // Don't log via the Event Log unless flagged on (which should never be the
+  // case by default).
+  if (!DokanOpLockDebugEnabled()) {
+    return;
+  }
+  if (FsControlCode == FSCTL_REQUEST_OPLOCK) {
+    DokanLogInfo(Logger, L"Oplock request FSCTL_REQUEST_OPLOCK for file %wZ;"
+                 L" oplock count %d; acquired FCB %d; acquired VCB %d;"
+                 L" level = %I32x; flags = %I32x",
+                 &Fcb->FileName, OplockCount, AcquiredFcb, AcquiredVcb,
+                 RequestedLevel, Flags);
+    return;
+  }
+  DokanLogInfo(Logger, L"Oplock request %s for file %wZ; oplock count %d;"
+               L" acquired FCB %d; acquired VCB %d",
+               DokanGetOplockControlCodeName(FsControlCode),
+               &Fcb->FileName, OplockCount, AcquiredFcb, AcquiredVcb);
+}
+
+void DokanMaybeLogOplockResult(__in PDOKAN_LOGGER Logger,
+                               __in PDokanFCB Fcb,
+                               __in ULONG FsControlCode,
+                               __in ULONG RequestedLevel,
+                               __in ULONG Flags,
+                               __in NTSTATUS Status) {
+  if (!DokanOpLockDebugEnabled()) {
+    return;
+  }
+  if (FsControlCode == FSCTL_REQUEST_OPLOCK) {
+    DokanLogInfo(Logger, L"Oplock result for FSCTL_REQUEST_OPLOCK for file %wZ;"
+                 L" level = %I32x; flags = %I32x; status = 0x%I32x",
+                 &Fcb->FileName, RequestedLevel, Flags, Status);
+    return;
+  }
+  DokanLogInfo(Logger, L"Oplock result for %s for file %wZ; status = 0x%I32x",
+               DokanGetOplockControlCodeName(FsControlCode), &Fcb->FileName,
+               Status);
+}
 
 NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
   NTSTATUS Status = STATUS_SUCCESS;
@@ -35,18 +120,15 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
   PDokanCCB Ccb;
   PFILE_OBJECT fileObject;
   PIRP Irp = *pIrp;
-
   ULONG OplockCount = 0;
 
   PIO_STACK_LOCATION IrpSp = IoGetCurrentIrpStackLocation(Irp);
 
   BOOLEAN AcquiredVcb = FALSE;
+  BOOLEAN AcquiredFcb = FALSE;
 
-#if (NTDDI_VERSION >= NTDDI_WIN7)
   PREQUEST_OPLOCK_INPUT_BUFFER InputBuffer = NULL;
-  ULONG InputBufferLength;
   ULONG OutputBufferLength;
-#endif
 
   PAGED_CODE();
 
@@ -69,31 +151,36 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
     DDbgPrint("    DokanOplockRequest STATUS_INVALID_PARAMETER\n");
     return STATUS_INVALID_PARAMETER;
   }
-
+  OplockDebugRecordMajorFunction(Fcb, IRP_MJ_FILE_SYSTEM_CONTROL);
   Vcb = Fcb->Vcb;
   if (Vcb == NULL || Vcb->Identifier.Type != VCB) {
     DDbgPrint("    DokanOplockRequest STATUS_INVALID_PARAMETER\n");
     return STATUS_INVALID_PARAMETER;
   }
-  Dcb = Vcb->Dcb;
+  DOKAN_INIT_LOGGER(logger, Vcb->DeviceObject->DriverObject, 0);
 
-#if (NTDDI_VERSION >= NTDDI_WIN7)
+  Dcb = Vcb->Dcb;
+  if (Dcb == NULL || Dcb->Identifier.Type != DCB) {
+    return STATUS_INVALID_PARAMETER;
+  }
+
+  if (Dcb->MountOptions & DOKAN_EVENT_DISABLE_OPLOCKS) {
+    return STATUS_NOT_SUPPORTED;
+  }
 
   //
   //  Get the input & output buffer lengths and pointers.
   //
   if (FsControlCode == FSCTL_REQUEST_OPLOCK) {
 
-    InputBufferLength = IrpSp->Parameters.FileSystemControl.InputBufferLength;
-    InputBuffer = (PREQUEST_OPLOCK_INPUT_BUFFER)Irp->AssociatedIrp.SystemBuffer;
-
     OutputBufferLength = IrpSp->Parameters.FileSystemControl.OutputBufferLength;
 
     //
     //  Check for a minimum length on the input and ouput buffers.
     //
-    if ((InputBufferLength < sizeof(REQUEST_OPLOCK_INPUT_BUFFER)) ||
-        (OutputBufferLength < sizeof(REQUEST_OPLOCK_OUTPUT_BUFFER))) {
+    GET_IRP_BUFFER_OR_RETURN(Irp, InputBuffer)
+    // Use OutputBuffer only for buffer size check
+    if (OutputBufferLength < sizeof(REQUEST_OPLOCK_OUTPUT_BUFFER)) {
       DDbgPrint("    DokanOplockRequest STATUS_BUFFER_TOO_SMALL\n");
       return STATUS_BUFFER_TOO_SMALL;
     }
@@ -112,8 +199,6 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
     return STATUS_INVALID_PARAMETER;
   }
 
-#endif
-
   //
   //  Use a try finally to free the Fcb/Vcb
   //
@@ -126,56 +211,50 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
     if ((FsControlCode == FSCTL_REQUEST_OPLOCK_LEVEL_1) ||
         (FsControlCode == FSCTL_REQUEST_BATCH_OPLOCK) ||
         (FsControlCode == FSCTL_REQUEST_FILTER_OPLOCK) ||
-        (FsControlCode == FSCTL_REQUEST_OPLOCK_LEVEL_2)
-#if (NTDDI_VERSION >= NTDDI_WIN7)
-        || ((FsControlCode == FSCTL_REQUEST_OPLOCK) &&
+        (FsControlCode == FSCTL_REQUEST_OPLOCK_LEVEL_2) ||
+        ((FsControlCode == FSCTL_REQUEST_OPLOCK) &&
             FlagOn(InputBuffer->Flags, REQUEST_OPLOCK_INPUT_FLAG_REQUEST))
-#endif
-            ) {
+    ) {
 
-      AcquiredVcb = ExAcquireResourceSharedLite(&(Fcb->Vcb->Resource), TRUE);
+      DokanVCBLockRO(Fcb->Vcb);
+      AcquiredVcb = TRUE;
+      DokanFCBLockRW(Fcb);
+      AcquiredFcb = TRUE;
 
-#if (NTDDI_VERSION >= NTDDI_WIN7)
-      if (!Dcb->FileLockInUserMode && FsRtlOplockIsSharedRequest(Irp)) {
-#else
-      if (!Dcb->FileLockInUserMode &&
-          FsControlCode == FSCTL_REQUEST_OPLOCK_LEVEL_2) {
-#endif
-        //
-        //  Byte-range locks are only valid on files.
-        //
-        if (!DokanFCBFlagsIsSet(Fcb, DOKAN_FILE_DIRECTORY)) {
+      if (!(Dcb->MountOptions & DOKAN_EVENT_FILELOCK_USER_MODE)) {
 
-//
-//  Set OplockCount to nonzero if FsRtl denies access
-//  based on current byte-range lock state.
-//
-#if (NTDDI_VERSION >= NTDDI_WIN8)
-          OplockCount = (ULONG)!FsRtlCheckLockForOplockRequest(
-              &Fcb->FileLock, &Fcb->AdvancedFCBHeader.AllocationSize);
-#elif (NTDDI_VERSION >= NTDDI_WIN7)
-          OplockCount =
-              (ULONG)FsRtlAreThereCurrentOrInProgressFileLocks(&Fcb->FileLock);
-#else
-        OplockCount = (ULONG)FsRtlAreThereCurrentFileLocks(&Fcb->FileLock);
-#endif
+        if (FsRtlOplockIsSharedRequest(Irp)) {
+          //
+          //  Byte-range locks are only valid on files.
+          //
+          if (!DokanFCBFlagsIsSet(Fcb, DOKAN_FILE_DIRECTORY)) {
+
+            //
+            //  Set OplockCount to nonzero if FsRtl denies access
+            //  based on current byte-range lock state.
+            //
+            if (DokanFsRtlCheckLockForOplockRequest) // Win8+
+              OplockCount = (ULONG)!DokanFsRtlCheckLockForOplockRequest(
+                  &Fcb->FileLock, &Fcb->AdvancedFCBHeader.AllocationSize);
+            else
+              OplockCount = (ULONG)FsRtlAreThereCurrentOrInProgressFileLocks(
+                  &Fcb->FileLock);
+          }
+        } else {
+          // Shouldn't be something like UncleanCount counter and not FileCount
+          // here?
+          OplockCount = Fcb->FileCount;
         }
-      } else {
-        // Shouldn't be something like UncleanCount counter and not FileCount
-        // here?
-        OplockCount = 0;//Fcb->FileCount;
       }
     } else if ((FsControlCode == FSCTL_OPLOCK_BREAK_ACKNOWLEDGE) ||
                (FsControlCode == FSCTL_OPBATCH_ACK_CLOSE_PENDING) ||
                (FsControlCode == FSCTL_OPLOCK_BREAK_NOTIFY) ||
-               (FsControlCode == FSCTL_OPLOCK_BREAK_ACK_NO_2)
-#if (NTDDI_VERSION >= NTDDI_WIN7)
-               || ((FsControlCode == FSCTL_REQUEST_OPLOCK) &&
+               (FsControlCode == FSCTL_OPLOCK_BREAK_ACK_NO_2) ||
+               ((FsControlCode == FSCTL_REQUEST_OPLOCK) &&
                    FlagOn(InputBuffer->Flags, REQUEST_OPLOCK_INPUT_FLAG_ACK))
-#endif
-                   ) {
-
-#if (NTDDI_VERSION >= NTDDI_WIN7)
+    ) {
+      DokanFCBLockRO(Fcb);
+      AcquiredFcb = TRUE;
     } else if (FsControlCode == FSCTL_REQUEST_OPLOCK) {
       //
       //  The caller didn't provide either REQUEST_OPLOCK_INPUT_FLAG_REQUEST or
@@ -185,9 +264,6 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
       Status = STATUS_INVALID_PARAMETER;
       __leave;
     } else {
-#else
-    } else {
-#endif
       DDbgPrint("    DokanOplockRequest STATUS_INVALID_PARAMETER\n");
       Status = STATUS_INVALID_PARAMETER;
       __leave;
@@ -198,12 +274,9 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
     //  for delete.
     //
     if (((FsControlCode == FSCTL_REQUEST_FILTER_OPLOCK) ||
-         (FsControlCode == FSCTL_REQUEST_BATCH_OPLOCK)
-#if (NTDDI_VERSION >= NTDDI_WIN7)
-         ||
+         (FsControlCode == FSCTL_REQUEST_BATCH_OPLOCK) ||
          ((FsControlCode == FSCTL_REQUEST_OPLOCK) &&
           FlagOn(InputBuffer->RequestedOplockLevel, OPLOCK_LEVEL_CACHE_HANDLE))
-#endif
              ) &&
         DokanFCBFlagsIsSet(Fcb, DOKAN_DELETE_ON_CLOSE)) {
 
@@ -212,11 +285,21 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
       __leave;
     }
 
+    ULONG level = 0;
+    ULONG flags = 0;
+    if (FsControlCode == FSCTL_REQUEST_OPLOCK) {
+      level = InputBuffer->RequestedOplockLevel;
+      flags = InputBuffer->Flags;
+    }
+    DokanMaybeLogOplockRequest(&logger, Fcb, FsControlCode, OplockCount,
+                               AcquiredFcb, AcquiredVcb, level, flags);
+
     //
     //  Call the FsRtl routine to grant/acknowledge oplock.
     //
     Status = FsRtlOplockFsctrl(DokanGetFcbOplock(Fcb), Irp, OplockCount);
-
+    DokanMaybeLogOplockResult(&logger, Fcb, FsControlCode, level, flags,
+                              Status);
     //
     //  Once we call FsRtlOplockFsctrl, we no longer own the IRP and we should
     //  not complete it.
@@ -228,11 +311,15 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
     //
     //  Release all of our resources
     //
+    if (AcquiredFcb) {
+      DokanFCBUnlock(Fcb);
+    }
     if (AcquiredVcb) {
-      ExReleaseResourceLite(&(Fcb->Vcb->Resource));
+      DokanVCBUnlock(Fcb->Vcb);
     }
 
-    DDbgPrint("    DokanOplockRequest return 0x%x\n", Status);
+    DDbgPrint("    DokanOplockRequest return 0x%x %ls\n", Status,
+              DokanGetNTSTATUSStr(Status));
   }
 
   return Status;
@@ -240,14 +327,110 @@ NTSTATUS DokanOplockRequest(__in PIRP *pIrp) {
 
 NTSTATUS
 DokanUserFsRequest(__in PDEVICE_OBJECT DeviceObject, __in PIRP *pIrp) {
-  NTSTATUS status = STATUS_NOT_IMPLEMENTED;
+  NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
   PIO_STACK_LOCATION irpSp;
-
-  UNREFERENCED_PARAMETER(DeviceObject);
+  PFILE_OBJECT fileObject = NULL;
+  PDokanCCB ccb = NULL;
+  PDokanFCB fcb = NULL;
+  DOKAN_INIT_LOGGER(logger, DeviceObject->DriverObject,
+                    IRP_MJ_FILE_SYSTEM_CONTROL);
 
   irpSp = IoGetCurrentIrpStackLocation(*pIrp);
 
   switch (irpSp->Parameters.FileSystemControl.FsControlCode) {
+  case FSCTL_ACTIVATE_KEEPALIVE:
+    fileObject = irpSp->FileObject;
+    if (fileObject == NULL) {
+      return DokanLogError(
+          &logger,
+          STATUS_INVALID_PARAMETER,
+          L"Received FSCTL_ACTIVATE_KEEPALIVE with no FileObject.");
+    }
+    ccb = fileObject->FsContext2;
+    if (ccb == NULL || ccb->Identifier.Type != CCB) {
+      return DokanLogError(
+          &logger,
+          STATUS_INVALID_PARAMETER,
+          L"Received FSCTL_ACTIVATE_KEEPALIVE with no CCB.");
+    }
+
+    fcb = ccb->Fcb;
+    if (fcb == NULL || fcb->Identifier.Type != FCB) {
+      return DokanLogError(
+          &logger,
+          STATUS_INVALID_PARAMETER,
+          L"Received FSCTL_ACTIVATE_KEEPALIVE with no FCB.");
+    }
+
+    if (!fcb->IsKeepalive) {
+      return DokanLogError(
+          &logger,
+          STATUS_INVALID_PARAMETER,
+          L"Received FSCTL_ACTIVATE_KEEPALIVE for wrong file: %wZ",
+          &fcb->FileName);
+    }
+
+    if (fcb->Vcb->IsKeepaliveActive && !ccb->IsKeepaliveActive) {
+      return DokanLogError(
+          &logger,
+          STATUS_INVALID_PARAMETER,
+          L"Received FSCTL_ACTIVATE_KEEPALIVE when a different keepalive handle"
+          L" was already active.");
+    }
+
+    DokanLogInfo(&logger, L"Activating keepalive handle from process %lu.",
+                 IoGetRequestorProcessId(*pIrp));
+    DokanFCBLockRW(fcb);
+    ccb->IsKeepaliveActive = TRUE;
+    fcb->Vcb->IsKeepaliveActive = TRUE;
+    DokanFCBUnlock(fcb);
+    status = STATUS_SUCCESS;
+    break;
+
+  case FSCTL_NOTIFY_PATH: {
+    PDOKAN_NOTIFY_PATH_INTERMEDIATE pNotifyPath = NULL;
+    GET_IRP_NOTIFY_PATH_INTERMEDIATE_OR_RETURN(*pIrp, pNotifyPath)
+
+    irpSp = IoGetCurrentIrpStackLocation(*pIrp);
+    fileObject = irpSp->FileObject;
+    if (fileObject == NULL) {
+      return DokanLogError(
+          &logger,
+          STATUS_INVALID_PARAMETER,
+          L"Received FSCTL_NOTIFY_PATH with no FileObject.");
+    }
+    ccb = fileObject->FsContext2;
+    if (ccb == NULL || ccb->Identifier.Type != CCB) {
+      return DokanLogError(
+          &logger,
+          STATUS_INVALID_PARAMETER,
+          L"Received FSCTL_NOTIFY_PATH with no CCB.");
+    }
+    fcb = ccb->Fcb;
+    if (fcb == NULL || fcb->Identifier.Type != FCB) {
+      return DokanLogError(
+          &logger,
+          STATUS_INVALID_PARAMETER,
+          L"Received FSCTL_NOTIFY_PATH with no FCB.");
+    }
+    UNICODE_STRING receivedBuffer;
+    receivedBuffer.Length = pNotifyPath->Length;
+    receivedBuffer.MaximumLength = pNotifyPath->Length;
+    receivedBuffer.Buffer = pNotifyPath->Buffer;
+    DDbgPrint(
+        "Received FSCTL_NOTIFY_PATH, CompletionFilter: %lu, Action: %lu, "
+        "Length: %i, Path: %wZ", pNotifyPath->CompletionFilter,
+        pNotifyPath->Action, receivedBuffer.Length, &receivedBuffer);
+    DokanFCBLockRO(fcb);
+    status = DokanNotifyReportChange0(
+        fcb, &receivedBuffer, pNotifyPath->CompletionFilter,
+        pNotifyPath->Action);
+    DokanFCBUnlock(fcb);
+    if (status == STATUS_OBJECT_NAME_INVALID) {
+      DokanCleanupAllChangeNotificationWaiters(fcb->Vcb);
+    }
+    break;
+  }
 
   case FSCTL_REQUEST_OPLOCK_LEVEL_1:
     DDbgPrint("    FSCTL_REQUEST_OPLOCK_LEVEL_1\n");
@@ -289,12 +472,10 @@ DokanUserFsRequest(__in PDEVICE_OBJECT DeviceObject, __in PIRP *pIrp) {
     status = DokanOplockRequest(pIrp);
     break;
 
-#if (NTDDI_VERSION >= NTDDI_WIN7)
   case FSCTL_REQUEST_OPLOCK:
     DDbgPrint("    FSCTL_REQUEST_OPLOCK\n");
     status = DokanOplockRequest(pIrp);
     break;
-#endif
 
   case FSCTL_LOCK_VOLUME:
     DDbgPrint("    FSCTL_LOCK_VOLUME\n");
@@ -349,8 +530,6 @@ DokanUserFsRequest(__in PDEVICE_OBJECT DeviceObject, __in PIRP *pIrp) {
 
   case FSCTL_FILESYSTEM_GET_STATISTICS:
     DDbgPrint("    FSCTL_FILESYSTEM_GET_STATISTICS\n");
-    // must return STATUS_INVALID_DEVICE_REQUEST for network share to work in win8 and above.
-    status = STATUS_INVALID_DEVICE_REQUEST;
     break;
 
   case FSCTL_GET_NTFS_VOLUME_DATA:
@@ -519,6 +698,134 @@ DokanUserFsRequest(__in PDEVICE_OBJECT DeviceObject, __in PIRP *pIrp) {
   return status;
 }
 
+// Returns TRUE if |dcb| type matches |DCB| and FALSE otherwise.
+BOOLEAN MatchDokanDCBType(__in PDokanDCB Dcb,
+                          __in PDOKAN_LOGGER Logger,
+                          __in BOOLEAN LogFailures) {
+  if (!Dcb) {
+    if (LogFailures) {
+      DokanLogInfo(Logger, L"There is no DCB.");
+    }
+    return FALSE;
+  }
+  PrintIdType(Dcb);
+  if (GetIdentifierType(Dcb) != DCB) {
+    if (LogFailures) {
+      DokanLogInfo(Logger, L"The DCB type is actually %x; expected %x.",
+                   GetIdentifierType(Dcb), DCB);
+    }
+    return FALSE;
+  }
+  return TRUE;
+}
+
+PCHAR CreateSetReparsePointRequest(PUNICODE_STRING SymbolicLinkName,
+                                   PULONG Length) {
+  DDbgPrint("==> CreateSetReparsePointRequest\n");
+  USHORT mountPointReparsePathLength =
+      SymbolicLinkName->Length + sizeof(WCHAR) /* "\\" */;
+  *Length =
+      FIELD_OFFSET(REPARSE_DATA_BUFFER, MountPointReparseBuffer.PathBuffer) +
+      mountPointReparsePathLength + sizeof(WCHAR) + sizeof(WCHAR);
+  PREPARSE_DATA_BUFFER reparseData = DokanAllocZero(*Length);
+  if (!reparseData) {
+    DDbgPrint("  Failed to allocate reparseData buffer\n");
+    *Length = 0;
+    return NULL;
+  }
+
+  reparseData->ReparseTag = IO_REPARSE_TAG_MOUNT_POINT;
+  reparseData->ReparseDataLength =
+      (USHORT)(*Length) - REPARSE_DATA_BUFFER_HEADER_SIZE;
+  reparseData->MountPointReparseBuffer.SubstituteNameOffset = 0;
+  reparseData->MountPointReparseBuffer.SubstituteNameLength =
+      mountPointReparsePathLength;
+  reparseData->MountPointReparseBuffer.PrintNameOffset =
+      reparseData->MountPointReparseBuffer.SubstituteNameLength + sizeof(WCHAR);
+  reparseData->MountPointReparseBuffer.PrintNameLength = 0;
+  // SET_REPARSE expect a path ending with a backslash
+  // We add it manually to our PersistanteSymbolicLink: \??\Volume{GUID}
+  RtlCopyMemory(reparseData->MountPointReparseBuffer.PathBuffer,
+                SymbolicLinkName->Buffer, SymbolicLinkName->Length);
+  reparseData->MountPointReparseBuffer
+      .PathBuffer[mountPointReparsePathLength / sizeof(WCHAR) - 1] = L'\\';
+
+  DDbgPrint("<== CreateSetReparsePointRequest\n");
+  return (PCHAR)reparseData;
+}
+
+PCHAR CreateRemoveReparsePointRequest(PULONG Length) {
+  DDbgPrint("==> CreateRemoveReparsePointRequest\n");
+  *Length = REPARSE_GUID_DATA_BUFFER_HEADER_SIZE;
+  PREPARSE_DATA_BUFFER reparseData =
+      DokanAllocZero(sizeof(REPARSE_DATA_BUFFER));
+  if (!reparseData) {
+    DDbgPrint("  Failed to allocate reparseGuidData buffer\n");
+    *Length = 0;
+    return NULL;
+  }
+  reparseData->ReparseTag = IO_REPARSE_TAG_MOUNT_POINT;
+  DDbgPrint("<== CreateRemoveReparsePointRequest\n");
+  return (PCHAR)reparseData;
+}
+
+NTSTATUS SendDirectoryFsctl(PDEVICE_OBJECT DeviceObject, PUNICODE_STRING Path,
+                            ULONG Code, PCHAR Input, ULONG Length) {
+  HANDLE handle = 0;
+  PUNICODE_STRING directoryStr = NULL;
+  DOKAN_INIT_LOGGER(logger, DeviceObject->DriverObject,
+                    IRP_MJ_FILE_SYSTEM_CONTROL);
+
+  DDbgPrint("==> SendDirectoryFsctl\n");
+
+  __try {
+    // Convert Dcb MountPoint \DosDevices\C:\foo to \??\C:\foo
+    directoryStr = ChangePrefix(Path, &g_DosDevicesPrefix, TRUE /*HasPrefix*/,
+                                &g_ObjectManagerPrefix);
+    if (!directoryStr) {
+      return DokanLogError(&logger, STATUS_INVALID_PARAMETER,
+                           L"  Failed to change prefix for %wZ\n", Path);
+    }
+
+    // Open the directory as \??\C:\foo
+    IO_STATUS_BLOCK ioStatusBlock;
+    OBJECT_ATTRIBUTES objectAttributes;
+    InitializeObjectAttributes(&objectAttributes, directoryStr,
+                               OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL,
+                               NULL);
+    DDbgPrint("  Open directory %wZ\n", directoryStr);
+    NTSTATUS result = ZwOpenFile(
+        &handle, FILE_WRITE_ATTRIBUTES, &objectAttributes, &ioStatusBlock,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT);
+    if (!NT_SUCCESS(result)) {
+      return DokanLogError(
+          &logger, result,
+          L"SendDirectoryFsctl - ZwOpenFile failed to open %wZ\n",
+          directoryStr);
+    }
+
+    result = ZwFsControlFile(handle, NULL, NULL, NULL, &ioStatusBlock, Code,
+                             Input, Length, NULL, 0);
+    if (!NT_SUCCESS(result)) {
+      return DokanLogError(
+          &logger, result,
+          L"SendDirectoryFsctl - ZwFsControlFile Code %X on %wZ failed\n", Code,
+          directoryStr);
+    }
+  } __finally {
+   if (directoryStr) {
+      DokanFreeUnicodeString(directoryStr);
+    }
+    if (handle) {
+      ZwClose(handle);
+    }
+  }
+
+  DDbgPrint("<== SendDirectoryFsctl\n");
+  return STATUS_SUCCESS;
+}
+
 NTSTATUS DokanMountVolume(__in PDEVICE_OBJECT DiskDevice, __in PIRP Irp) {
   PDokanDCB dcb = NULL;
   PDokanVCB vcb = NULL;
@@ -529,6 +836,9 @@ NTSTATUS DokanMountVolume(__in PDEVICE_OBJECT DiskDevice, __in PIRP Irp) {
   PDEVICE_OBJECT volDeviceObject;
   PDRIVER_OBJECT DriverObject = DiskDevice->DriverObject;
   NTSTATUS status = STATUS_UNRECOGNIZED_VOLUME;
+
+  DOKAN_INIT_LOGGER(logger, DriverObject, IRP_MJ_FILE_SYSTEM_CONTROL);
+  DokanLogInfo(&logger, L"Mounting disk device.");
 
   irpSp = IoGetCurrentIrpStackLocation(Irp);
   dcb = irpSp->Parameters.MountVolume.DeviceObject->DeviceExtension;
@@ -543,15 +853,15 @@ NTSTATUS DokanMountVolume(__in PDEVICE_OBJECT DiskDevice, __in PIRP Irp) {
   }
 
   if (IsDeletePending(dcb->DeviceObject)) {
-    DDbgPrint(" This is a remount try of the device");
-    return STATUS_DEVICE_REMOVED;
+    return DokanLogError(&logger, STATUS_DEVICE_REMOVED,
+                         L"This is a remount try of the device.");
   }
 
   BOOLEAN isNetworkFileSystem =
       (dcb->VolumeDeviceType == FILE_DEVICE_NETWORK_FILE_SYSTEM);
 
-  DDbgPrint(" Mounting volume using MountPoint %wZ device %wZ \n",
-            dcb->MountPoint, dcb->DiskDeviceName);
+  DokanLogInfo(&logger, L"Mounting volume using MountPoint %wZ device %wZ",
+               dcb->MountPoint, dcb->DiskDeviceName);
 
   if (!isNetworkFileSystem) {
     status = IoCreateDevice(DriverObject,               // DriverObject
@@ -575,8 +885,7 @@ NTSTATUS DokanMountVolume(__in PDEVICE_OBJECT DiskDevice, __in PIRP Irp) {
   }
 
   if (!NT_SUCCESS(status)) {
-    DDbgPrint("  IoCreateDevice failed: 0x%x\n", status);
-    return status;
+    return DokanLogError(&logger, status, L"IoCreateDevice failed.");
   }
 
   vcb = volDeviceObject->DeviceExtension;
@@ -585,7 +894,16 @@ NTSTATUS DokanMountVolume(__in PDEVICE_OBJECT DiskDevice, __in PIRP Irp) {
 
   vcb->DeviceObject = volDeviceObject;
   vcb->Dcb = dcb;
+  vcb->ResourceLogger.DriverObject = DriverObject;
+  vcb->ValidFcbMask = 0xffffffffffffffff;
   dcb->Vcb = vcb;
+
+  if (vcb->Dcb->FcbGarbageCollectionIntervalMs != 0) {
+    InitializeListHead(&vcb->FcbGarbageList);
+    KeInitializeEvent(&vcb->FcbGarbageListNotEmpty, SynchronizationEvent,
+                      FALSE);
+    DokanStartFcbGarbageCollector(vcb);
+  }
 
   InitializeListHead(&vcb->NextFCB);
 
@@ -594,15 +912,8 @@ NTSTATUS DokanMountVolume(__in PDEVICE_OBJECT DiskDevice, __in PIRP Irp) {
 
   ExInitializeFastMutex(&vcb->AdvancedFCBHeaderMutex);
 
-#if _WIN32_WINNT >= 0x0501
   FsRtlSetupAdvancedHeader(&vcb->VolumeFileHeader,
                            &vcb->AdvancedFCBHeaderMutex);
-#else
-  if (DokanFsRtlTeardownPerStreamContexts) {
-    FsRtlSetupAdvancedHeader(&vcb->VolumeFileHeader,
-                             &vcb->AdvancedFCBHeaderMutex);
-  }
-#endif
 
   vpb = irpSp->Parameters.MountVolume.Vpb;
   DokanInitVpb(vpb, vcb->DeviceObject);
@@ -617,47 +928,77 @@ NTSTATUS DokanMountVolume(__in PDEVICE_OBJECT DiskDevice, __in PIRP Irp) {
   ObReferenceObject(volDeviceObject);
 
   DDbgPrint("  ExAcquireResourceExclusiveLite dcb resource \n")
-      ExAcquireResourceExclusiveLite(&dcb->Resource, TRUE);
+  ExAcquireResourceExclusiveLite(&dcb->Resource, TRUE);
 
   // set the device on dokanControl
-  RtlZeroMemory(&dokanControl, sizeof(dokanControl));
+  RtlZeroMemory(&dokanControl, sizeof(DOKAN_CONTROL));
   RtlCopyMemory(dokanControl.DeviceName, dcb->DiskDeviceName->Buffer,
                 dcb->DiskDeviceName->Length);
   if (dcb->UNCName->Buffer != NULL && dcb->UNCName->Length > 0) {
     RtlCopyMemory(dokanControl.UNCName, dcb->UNCName->Buffer,
                   dcb->UNCName->Length);
   }
+  dokanControl.SessionId = dcb->SessionId;
   mountEntry = FindMountEntry(dcb->Global, &dokanControl, TRUE);
   if (mountEntry != NULL) {
-    mountEntry->MountControl.DeviceObject = volDeviceObject;
+    mountEntry->MountControl.VolumeDeviceObject = volDeviceObject;
+    mountEntry->MountControl.MountOptions = dcb->MountOptions;
   } else {
     ExReleaseResourceLite(&dcb->Resource);
-    DDbgPrint("MountEntry not found. This way the dokanControl does not have "
-              "the DeviceObject \n") return STATUS_DEVICE_REMOVED;
+    return DokanLogError(&logger, STATUS_DEVICE_REMOVED,
+                         L"MountEntry not found.");
   }
 
   ExReleaseResourceLite(&dcb->Resource);
 
   // Start check thread
   ExAcquireResourceExclusiveLite(&dcb->Resource, TRUE);
-  DokanUpdateTimeout(&dcb->TickCount, DOKAN_KEEPALIVE_TIMEOUT * 3);
+  DokanUpdateTimeout(&dcb->TickCount, DOKAN_KEEPALIVE_TIMEOUT_DEFAULT * 3);
   ExReleaseResourceLite(&dcb->Resource);
   DokanStartCheckThread(dcb);
 
+  BOOLEAN isDriveLetter = IsMountPointDriveLetter(dcb->MountPoint);
   // Create mount point for the volume
   if (dcb->UseMountManager) {
+    BOOLEAN autoMountStateBackup = TRUE;
+    if (!isDriveLetter) {
+      ExAcquireResourceExclusiveLite(&dcb->Global->MountManagerLock, TRUE);
+      // Query current AutoMount State to restore it afterward.
+      DokanQueryAutoMount(&autoMountStateBackup);
+      // In case of failure, we suppose it was Enabled.
+
+      // MountManager suggest workflow do not accept a path longer than
+      // a driver letter mount point so we cannot use it to suggest
+      // our directory mount point. We disable Mount Manager AutoMount
+      // for avoiding having a driver letter assign to our device
+      // for the time we create our own mount point.
+      if (autoMountStateBackup) {
+        DokanSendAutoMount(FALSE);
+      }
+    }
     status = DokanSendVolumeArrivalNotification(dcb->DiskDeviceName);
     if (!NT_SUCCESS(status)) {
-      DDbgPrint("  DokanSendVolumeArrivalNotification failed: 0x%x\n", status);
+      DokanLogError(&logger, status,
+                    L"DokanSendVolumeArrivalNotification failed.");
+    }
+    if (!isDriveLetter) {
+      // Restore previous AutoMount state.
+      if (autoMountStateBackup) {
+        DokanSendAutoMount(TRUE);
+      }
+      ExReleaseResourceLite(&dcb->Global->MountManagerLock);
     }
   }
-  DokanCreateMountPoint(dcb);
 
-  if (isNetworkFileSystem) {
-    DokanRegisterUncProviderSystem(dcb);
+  if (isDriveLetter) {
+    DokanCreateMountPoint(dcb);
   }
 
-  DDbgPrint("  Mounting successfully done \n");
+  if (isNetworkFileSystem) {
+    RunAsSystem(DokanRegisterUncProvider, dcb);
+  }
+
+  DokanLogInfo(&logger, L"Mounting successfully done.");
 
   return STATUS_SUCCESS;
 }
@@ -675,7 +1016,7 @@ VOID DokanInitVpb(__in PVPB Vpb, __in PDEVICE_OBJECT VolumeDevice) {
 NTSTATUS
 DokanDispatchFileSystemControl(__in PDEVICE_OBJECT DeviceObject,
                                __in PIRP Irp) {
-  NTSTATUS status = STATUS_INVALID_PARAMETER;
+  NTSTATUS status = STATUS_INVALID_DEVICE_REQUEST;
   PIO_STACK_LOCATION irpSp;
 
   __try {
@@ -709,14 +1050,11 @@ DokanDispatchFileSystemControl(__in PDEVICE_OBJECT DeviceObject,
 
     default:
       DDbgPrint("  unknown %d\n", irpSp->MinorFunction);
-      status = STATUS_INVALID_PARAMETER;
+      status = STATUS_INVALID_DEVICE_REQUEST;
       break;
     }
-
   } __finally {
-
     DokanCompleteIrpRequest(Irp, status, 0);
-
     DDbgPrint("<== DokanFileSystemControl\n");
   }
 

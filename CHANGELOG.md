@@ -3,7 +3,271 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](http://keepachangelog.com/) and this project adheres to [Semantic Versioning](http://semver.org/).
 
-## [Unreleased] - 1.0.2.1000
+## [Unreleased]
+### Added
+- Kernel/Library - Added support for FileIdExtdDirectoryInformation; fixes directory listings under WSL2.
+### Fixed
+- Library - Return STATUS_INVALID_PARAMETER where appropriate; fixes directory listings under WSL2.
+
+## [1.4.0.1000] - 2020-01-06
+### Added
+- MemFS - Add a new FS sample project: dokan_memfs. MemFS is a better example to debug and know the dokan driver/library feature supported and NTFS compliant. The FS pass most of WinFSTest and IFSTest. It looks to be stable enough to be included in the installer. It hasn't been test with real usage but it is expected to run without issue. MemFS is written in c++ and is under MIT license.
+- Installer - You can now find two installers with binaries built with and without VC redistributable. If no issue is reported, the next release will only have without the VC redistributable.
+- Kernel - Support directory path mount with mount manager. 
+- Kernel - Add `DokanAllocZero` that Alloc and ZeroMemory buffer size requested sys - Rename `ExAllocatePool` to `DokanAlloc`.
+- Kernel - Add Input IRP Buffer Help macro.
+- Kernel - Use `GET_IRP` for `Type3InputBuffer` and start using Output buffer function helpers for IRP.
+- FUSE - Add mount manager option.
+
+### Changed
+- Kernel - Replace `DOKAN_OPTION_OPTIMIZE_SINGLE_NAME_SEARCH` by `DOKAN_OPTION_ENABLE_FCB_GARBAGE_COLLECTION`. The advantage of the GC approach is that it prevents filter drivers from exponentially slowing down procedures like zip file extraction due to repeatedly rebuilding state that they attach to the FCB header.
+- Kernel - Multiple code refactoring.
+- Kernel - Move and Improve `FixFileNameForReparseMountPoint`.
+- Kernel - `FileNetworkPhysicalNameInformation` now return directly the FileName instead of sending the request to userland.
+- Kernel - `FileAllocationInformation` - return `STATUS_USER_MAPPED`_FILE when trying to truncate a memory mapped file.
+- Kernel - Do not rethrow exception during `EXCEPTION_EXECUTE_HANDLER`.
+- Kernel - During EventRelease directly call `FsRtlNotifyCleanupAll` instead of going through all Fcb & Ccb.
+- Kernel - Change `DokanPrintNTStatus` with limited number of `NTSTATUS` values print to use `DokanGetNTSTATUSStr`. `DokanGetNTSTATUSStr` use `ntstatus_log.inc` that has all ntstatus from <ntstatus.h>.
+- Library - Add support for compiling with GCC.
+- Library - Move `DokanRemoveMountPointEx` to internal header as it is not available to the public API.
+
+### Fixed
+- FUSE - Read keep local filename instance.
+- Installer - Fix incorrect pdb file copied for driver.
+- Library - `DokanNetworkProviderInstall` return earlier if a Reg failure happens and not corrupt the registry.
+- Kernel - Catch `FsRtlNotifyFullReportChange` `STATUS_ACCESS_VIOLATION` exception.
+- Library - Correct newName format when a stream name is renamed. 
+
+## [1.3.1.1000] - 2019-12-16
+### Added
+- Kernel - Added support for `FileIdExtdBothDirectoryInformation`, which is required when the target is mapped as a volume into docker containers.
+
+### Changed
+- Kernel - Single build target Win7 / enable new features according to OS during runtime. Remove supported XP/Vista code.
+- Kernel - Only log to event viewer when debug default log is enabled.
+- Library - Clarified documentation of dokan file-change notification functions.
+- Build - Run Code Analysis on all builds of debug build configurations within Visual Studio, but not by default from msbuild.
+- Mirror - Add `GetDiskFreeSpace` UNC as Root support.
+
+### Fixed
+- Library - Incorrect call to `legacyKeepAliveThreadIds` `WaitForObject`.
+- Kernel - `FileNameInformation` - Only concat `UNCName` / `DiskDeviceName` for network devices.
+- FUSE - Infinite loop when using characters from Unicode supplementary planes ('🔈' for example).
+- FUSE - Support `WriteFile` with offset `-1`.
+- FUSE - `get_file` - Do not use the current file shared mode.
+
+## [1.3.0.1000] - 2019-07-24
+### Added
+- Mirror - Use `GetDiskFreeSpace` during `MirrorDokanGetDiskFreeSpace`.
+- Kernel - Add most important log msg to Event Viewer.
+- Kernel - Add `DOKAN_OPTION_DISABLE_OPLOCKS` dokan option.
+- Kernel - Add check that `DeviceControl` are performed on a volume handle and not a file.
+- Kernel - Add `DOKAN_OPTION_OPTIMIZE_SINGLE_NAME_SEARCH` dokan option to speedup Win7 file name normalization.
+- Library - Add functions to notify Dokan Kernel that files in use fs has changed `DokanNotifyCreate / DokanNotifyDelete / DokanNotifyUpdate / DokanNotifyXAttrUpdate / DokanNotifyRename`.
+- SetAssemblyVersion - Now update `DOKAN_MAJOR_API_VERSION`.
+- Kernel - Write - Check total event length is not longer than what we can allocate.
+
+### Changed
+- Use latest WDK & SDK for Windows 10 version 1903 and toolset v142.
+- Installer - Update VCRedistVersion to VS 2019 14.21.27702.
+- Mirror - Improve ShowUsage.
+- Library - `DokanGetMountPointList` now returns his own buffer that need to be released with `DokanReleaseMountPointList`.
+- Kernel - Return proper error status for `DFileSystemControl`.
+- Kernel - Fix OpLocks / Remove FCB Retry lock.
+- Kernel - Use debug mode option to enable lock or/and oplock kernel log.
+- Kernel - Rename `DOKAN_KEEPALIVE_TIMEOUT` to `DOKAN_KEEPALIVE_TIMEOUT_DEFAULT`
+
+### Fixed
+- Kernel - Fix long rename BSOD with network option enabled.
+- Kernel - Fix root rename with 360 antivirus.
+- Library - Use `DbgPrintW` instead of `DbgPrint` when printing wide characters.
+- Library - Add error check for `_vscprintf` and `vsprintf_s` in `DokanDbgPrint`, and `_vscwprintf` and `vswprintf_s` in `DokanDbgPrintW`.
+- Library - Fix `DokanUnmount` possible oob memory.
+- Mirror - Fix possible oob memory during long findfiles path.
+- Mirror - Fix possible oob memory during long DeleteDirectory path.
+- Kernel - Lock global resources during `DokanGetMountPointList` avoid possible BSOD.
+- Kernel - Send correct notify change during `FileRenameInformation` when move to a diff folder.
+- Kernel - Move all `Io ShareAccess` under fcb RW lock.
+- Dokannp - Add leading `\` to `UNCName` during `NPGetConnection`.
+
+## [1.2.2.1000] - 2019-03-08
+### Added
+- FUSE - Expose allocation unit size and sector size.
+- Kernel - Add new `FileDispositionInformationEx` for Windows 10, version 1709
+
+### Changed
+- Library - Increase `DOKAN_MAX_THREAD` from 15 to 63 for better performance.
+- Kernel - `FileStreamInformation` now return directly `STATUS_NOT_IMPLEMENTED` if `UseAltStream` is disabled.
+- Library - Improve `DokanIsNameInExpression` documentation
+
+### Fixed
+- Kernel - Wrong `szMountPoint->length` usage in `DokanGlobalEventRelease`
+- Kernel - Fix handle KeepAlive calls before device fully started 
+
+## [1.2.1.2000] - 2018-12-21
+### Added
+- SetAssemblyVersion - Add update dokan version define
+
+### Fixed
+- Library - Bump Dokan version to 121
+
+## [1.2.1.1000] - 2018-12-18
+### Changed
+- Kernel/Library - Replace keepalive ping event by a single keep alive file handle
+- Cert - Runs with admin rights and checks Secureboot is enabled
+
+### Fixed
+- Kernel - Fix Buffer Overflow by adding mount length path check 
+
+## [1.2.0.1000] - 2018-08-09
+### Added
+- Build - Add ARM64
+
+### Changed
+- Installer - Remove .NET dependency.
+- Build - Remove Windows 10 build for ARM
+- Library - Allow usage driver letter `A`
+- Documentation - Add `FSName` notice for `NTFS` & `FAT`
+- Documentation - Add `GetFileSecurity` return `STATUS_NOT_IMPLEMENTED` remark
+- Library - Update `DOKAN_VERSION` to 120 and `DOKAN_MINIMUM_COMPATIBLE_VERSION` to 110
+- Kernel - Only set FO_FILE_MODIFIED for no paging io during write complete
+
+### Fixed
+- Library - Missing session id in `DOKAN_CONTROL` for user space
+- NetworkProvider - UNC paths using only for current session show offline for other session.
+- Installer - Dokan Network Provider - Move back `dokannp1.dll` to `system32` folder and `SysWow64`
+- Mirror - Initialize `userTokenHandle` correctly
+- FUSE -  Return correct status when file is open `FILE_OVERWRITE_IF` or `FILE_OPEN_IF` successfully
+- Kernel - PageIO Dead lock
+- Library - Get correct name (not uppercase) when repase point mount is used
+
+## [1.1.0.2000] - 2018-01-19
+### Fixed
+- Installer - Fix Wrong redist download link rename
+- Installer - Fix vc++ version number displayed
+- Installer - Update message download VC link
+
+## [1.1.0.1000] - 2017-11-28
+### Added
+- Mirror - Add Impersonate Option for Security Enhancement.
+- FUSE - Add read-only option
+- Installer - Add VCRedistVersion variable / Now display version needed
+- Dokanctl - Add usage option /?
+- Kernel / Library - Add New FileRenameInformationEx since Windows 10 RS1
+
+### Changed
+- FUSE - cross-compile 32-bit Cygwin DLL from 64-bit
+- Library - Merge DokanMapStandardToGenericAccess with DokanMapKernelToUserCreateFileFlags
+- Move to VS 2017 / v141 / SDK 10.0.16299.0 / Installer Redist 2017
+
+### Fixed
+- Kernel - Fix current session unmount not releasing the device properly
+- Mirror - Cannot open a read only file for delete 
+- Mirror - Fix SetFileAttributes implementation by not updating when FileAttributes is 0x00
+- Installer - Wrong new logo size 
+- Kernel - Fixes #616 Only lock when not paging io 
+
+## [1.0.5.1000] - 2017-09-19
+### Added
+- Kernel - Add `FILE_NOTIFY_CHANGE_SECURITY` during SetSecurity
+
+### Changed
+- Kernel - Createfile move `DOKAN_DELETE_ON_CLOSE` set flag after create success
+- Kernel - Return access denied for paging file open request
+
+### Fixed
+- Kernel - CreateFile return `STATUS_DELETE_PENDING` for a request without share delete during a pending delete
+- Mirror - `FindClose` is not being called if `GetLastError` returns anything other `ERROR_NO_MORE_FILES`
+
+## [1.0.4.1000] - 2017-08-31
+### Added
+- Library - Support `FileIdFullDirectoryInformation`
+- CI - IFSTest !
+- Kernel - Add `FILE_NOTIFY_CHANGE_LAST_WRITE` in cleanup after write
+- Kernel - Notify file size changed after a write beyond old size
+
+### Changed
+- Mirror -  Query underlying fs for filesystem flags and AND them with mirror default flags.
+			Get filesystem name and maximum component length from underlying fs.
+			Change default maximum component length from 256 to 255.
+- Library - Doc Add context release info in CreateFile
+- Build - PS Sign - Add env variables required in comments
+- Mirror - Ensure the Security Descriptor length is set in mirror
+- Library - `DokanNetworkProviderUninstall` Make a single call of wcsstr
+- Library - `DokanNetworkProviderUninstall` if `DOKAN_NP_NAME` is already removed return `TRUE`
+- Mirror - Return `STATUS_INVALID_PARAMETER` error when folder is asked to be created with `FILE_ATTRIBUTE_TEMPORARY`
+- Mirror - Always set `FILE_SHARE_READ` for directory to avoid sharing violation for `FindFirstFile`
+- Library - When looking parent folder if we have the right to remove a file, cleanup `FILE_NON_DIRECTORY_FILE`
+- Library - Set proper information for `FILE_OVERWRITE` (`TRUNCATE_EXISTING`) 
+- Mirror - Microsoft doc say `TRUNCATE_EXISTING` need GENERIC_WRITE so we add it
+
+### Fixed
+- Installer - Exe not signed
+- Mirror - add `FILE_NAMED_STREAMS` to FileSystemFlags
+- Kernel - Issue #490 #502 #503 #554 #412
+- Library - Fix dokanctl UAC execution level
+- FUSE - Warning due to `DWORD` printed as %d
+- FUSE - Braces warning and remove commented code
+- Kernel - BSOD with verifier enabled
+- Kernel - BSOD during searching the backslash
+- Kernel - Buffer len check `IOCTL_MOUNTDEV_QUERY_SUGGESTED_LINK_NAME`
+- Kernel - Fix wrong error return for invalid relative file creation with leading slash
+- Mirror - Return proper error when open a directory with `FILE_NON_DIRECTORY_FILE`
+- Mirror - Cannot overwrite a hidden or system file if flag not set return `STATUS_ACCESS_DENIED`
+- Mirror - Update FileAttributes with previous when `TRUNCATE_EXISTING` file 
+
+## [1.0.3.1000] - 2017-03-24
+### Added
+- Installer - WiX: Ship PDB-files for `dokanfuse.dll`.
+- Add Windows on ARM support.
+- FUSE - Add uncname option
+- Mirror - Add optional long path max
+- Library - Add `DefaultGetFileSecurity` when `GetFileSecurity` is not handled by user mode
+
+### Changed
+- Library - Improve some mount error messages.
+- FUSE - Return error when file open as directory with `FILE_NON_DIRECTORY_FILE`.
+- Kernel - Clean all global disk device data in `CleanupGlobalDiskDevice`
+- Kernel - Update mount point if mount manager did not follow our suggestion.
+
+### Fixed
+- Installer - Win10 x86 driver not properly signed for x86 anniversary.
+- Kernel - Fix deadlock in `DokanDispatchCleanup`.
+- Kernel - Do `MmFlushImageSection` if `ImageSectionObject` is set during cleanup.
+- Library - Don't send free'd `DOKAN_OPEN_INFO` pointer to the driver.
+- Library - Fix printf param for unsigned int.
+- Kernel - Add `DokanFreeMdl` for read operation in `DokanCompleteRead`.
+- Kernel - Fix crash issue cause by canceling the copy operation.
+- FUSE - Replace wrong error type returned
+- Library - Change rename fixed buffer to dynamic alloc
+- Library - Rename return directly if `MoveFile` is not implemented
+- Library - Low buffer handling correction on `QueryDirectory`
+- Library - Fix wrong buffer size provided to the kernel in `DokanGetMountPointList`
+- Kernel - Fix `dokanGlobal` wrongly zeroed and clean resource in `DokanUnload`
+- Kernel - Add missing `IoDeleteDevice` when `IoCreateSymbolicLink` fail
+- FUSE - Check for non-empty directories on delete #270.
+- Library - Use `NT_SUCCESS` in `CreateFile`
+
+## [1.0.2.1000] - 2017-01-20
+### Added
+- FUSE - Add libfuse-compatible pkg-config
+- Mirror - Add `DOKAN_OPTION_FILELOCK_USER_MODE` option with `/f`
+
+### Changed
+- FUSE - Use pkg-config for building mirror
+- Kernel - Many improvement allocation stack and heap
+- Kernel - Enable `PAGED_CODE` for `DokanCheckShareAccess`
+- Mirror - Return empty SACL if mirror doesn't have SeSecurityPrivilege
+- Library - Use `DeleteMountPoint` for removing reparse point instead of `DeleteVolumeMountPoint`
+- Library - Remove Redundant control flow jump 
+
+### Fixed
+- Driver - Less wide locking
+- Kernel - Align security descriptor to 4-byte boundary in `DokanDispatchSetSecurity`
+- Library - Fix dokan context leak when CreateFile fail 
+- Kernel - Fix BSOD. When drive is started using n option and procmon is attached the rename of files in the root folder is not possible
+- Kernel - Relative path rename
+- Library - Write Set correctly the userland NtStatus
 
 ## [1.0.1.1000] - 2016-11-04
 ### Added
@@ -214,7 +478,20 @@ Latest Dokan version from Hiroki Asakawa.
  [http://dokan-dev.net/en]( http://web.archive.org/web/20150419082954/http://dokan-dev.net/en/)
 
 
-[Unreleased]: https://github.com/dokan-dev/dokany/compare/v1.0.1...master
+[Unreleased]: https://github.com/dokan-dev/dokany/compare/v1.3.1.1000...master
+[1.4.0.1000]: https://github.com/dokan-dev/dokany/compare/v1.3.1.1000...v1.4.0.1000
+[1.3.1.1000]: https://github.com/dokan-dev/dokany/compare/v1.3.0.1000...v1.3.1.1000
+[1.3.0.1000]: https://github.com/dokan-dev/dokany/compare/v1.2.2.1000...v1.3.0.1000
+[1.2.2.1000]: https://github.com/dokan-dev/dokany/compare/v1.2.1.2000...v1.2.2.1000
+[1.2.1.2000]: https://github.com/dokan-dev/dokany/compare/v1.2.1.1000...v1.2.1.2000
+[1.2.1.1000]: https://github.com/dokan-dev/dokany/compare/v1.2.0.1000...v1.2.1.1000
+[1.2.0.1000]: https://github.com/dokan-dev/dokany/compare/v1.1.0.2000...v1.2.0.1000
+[1.1.0.2000]: https://github.com/dokan-dev/dokany/compare/v1.1.0...v1.1.0.2000
+[1.1.0.1000]: https://github.com/dokan-dev/dokany/compare/v1.0.5...v1.1.0
+[1.0.5.1000]: https://github.com/dokan-dev/dokany/compare/v1.0.4...v1.0.5
+[1.0.4.1000]: https://github.com/dokan-dev/dokany/compare/v1.0.3...v1.0.4
+[1.0.3.1000]: https://github.com/dokan-dev/dokany/compare/v1.0.2...v1.0.3
+[1.0.2.1000]: https://github.com/dokan-dev/dokany/compare/v1.0.1...v1.0.2
 [1.0.1.1000]: https://github.com/dokan-dev/dokany/compare/v1.0.0...v1.0.1
 [1.0.0.5000]: https://github.com/dokan-dev/dokany/compare/v0.8.0...v1.0.0
 [0.8.0]: https://github.com/dokan-dev/dokany/compare/v0.7.4...v0.8.0

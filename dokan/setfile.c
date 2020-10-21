@@ -1,7 +1,8 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2020 Google, Inc.
+  Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
   http://dokan-dev.github.io
@@ -40,14 +41,12 @@ DokanSetAllocationInformation(PEVENT_CONTEXT EventContext,
   // is less than the end-of-file position, the end-of-file position is
   // automatically
   // adjusted to match the allocation size.
-  NTSTATUS status;
+  NTSTATUS status = STATUS_NOT_IMPLEMENTED;
 
   if (DokanOperations->SetAllocationSize) {
     status = DokanOperations->SetAllocationSize(
         EventContext->Operation.SetFile.FileName,
         allocInfo->AllocationSize.QuadPart, FileInfo);
-  } else {
-    status = STATUS_NOT_IMPLEMENTED;
   }
 
   return status;
@@ -91,21 +90,39 @@ NTSTATUS
 DokanSetDispositionInformation(PEVENT_CONTEXT EventContext,
                                PDOKAN_FILE_INFO FileInfo,
                                PDOKAN_OPERATIONS DokanOperations) {
-  PFILE_DISPOSITION_INFORMATION dispositionInfo =
-      (PFILE_DISPOSITION_INFORMATION)(
-          (PCHAR)EventContext + EventContext->Operation.SetFile.BufferOffset);
+
+  BOOLEAN DeleteFileFlag = FALSE;
+  NTSTATUS result;
+
+  switch (EventContext->Operation.SetFile.FileInformationClass) {
+  case FileDispositionInformation: {
+    PFILE_DISPOSITION_INFORMATION dispositionInfo =
+        (PFILE_DISPOSITION_INFORMATION)(
+            (PCHAR)EventContext + EventContext->Operation.SetFile.BufferOffset);
+    DeleteFileFlag = dispositionInfo->DeleteFile;
+  } break;
+  case FileDispositionInformationEx: {
+    PFILE_DISPOSITION_INFORMATION_EX dispositionexInfo =
+        (PFILE_DISPOSITION_INFORMATION_EX)(
+            (PCHAR)EventContext + EventContext->Operation.SetFile.BufferOffset);
+
+    DeleteFileFlag = (dispositionexInfo->Flags & FILE_DISPOSITION_DELETE) != 0;
+  } break;
+  default:
+    return STATUS_INVALID_PARAMETER;
+  }
 
   if (!DokanOperations->DeleteFile || !DokanOperations->DeleteDirectory)
     return STATUS_NOT_IMPLEMENTED;
 
-  if (dispositionInfo->DeleteFile == FileInfo->DeleteOnClose) {
+  if (DeleteFileFlag == FileInfo->DeleteOnClose) {
     return STATUS_SUCCESS;
   }
 
-  if (DokanOperations->GetFileInformation) {
+  if (DokanOperations->GetFileInformation && DeleteFileFlag) {
     BY_HANDLE_FILE_INFORMATION byHandleFileInfo;
     ZeroMemory(&byHandleFileInfo, sizeof(BY_HANDLE_FILE_INFORMATION));
-    NTSTATUS result = DokanOperations->GetFileInformation(
+    result = DokanOperations->GetFileInformation(
         EventContext->Operation.SetFile.FileName, &byHandleFileInfo, FileInfo);
 
     if (result == STATUS_SUCCESS &&
@@ -113,15 +130,18 @@ DokanSetDispositionInformation(PEVENT_CONTEXT EventContext,
       return STATUS_CANNOT_DELETE;
   }
 
-  FileInfo->DeleteOnClose = (dispositionInfo->DeleteFile) ? TRUE : FALSE;
+  FileInfo->DeleteOnClose = DeleteFileFlag;
 
   if (FileInfo->IsDirectory) {
-    return DokanOperations->DeleteDirectory(
+    result = DokanOperations->DeleteDirectory(
         EventContext->Operation.SetFile.FileName, FileInfo);
   } else {
-    return DokanOperations->DeleteFile(EventContext->Operation.SetFile.FileName,
+    result = DokanOperations->DeleteFile(EventContext->Operation.SetFile.FileName,
                                        FileInfo);
   }
+  //Double set for later be sure FS user did not changed it
+  FileInfo->DeleteOnClose = DeleteFileFlag;
+  return result;
 }
 
 NTSTATUS
@@ -157,31 +177,42 @@ DokanSetRenameInformation(PEVENT_CONTEXT EventContext,
                           PDOKAN_OPERATIONS DokanOperations) {
   PDOKAN_RENAME_INFORMATION renameInfo = (PDOKAN_RENAME_INFORMATION)(
       (PCHAR)EventContext + EventContext->Operation.SetFile.BufferOffset);
+  NTSTATUS status = STATUS_NOT_IMPLEMENTED;
+  WCHAR *newName = NULL;
 
-  WCHAR newName[MAX_PATH];
-  ZeroMemory(newName, sizeof(newName));
+  if (!DokanOperations->MoveFile)
+    return STATUS_NOT_IMPLEMENTED;
 
-  if (renameInfo->FileName[0] != L'\\') {
-    ULONG pos;
+  if (renameInfo->FileName[0] != L'\\' && renameInfo->FileName[0] != L':') {
+    ULONGLONG pos;
     for (pos = EventContext->Operation.SetFile.FileNameLength / sizeof(WCHAR);
          pos != 0; --pos) {
       if (EventContext->Operation.SetFile.FileName[pos] == '\\')
         break;
     }
+    newName = (WCHAR *)malloc((pos + 1) * sizeof(WCHAR) +
+                              renameInfo->FileNameLength + sizeof(WCHAR));
+    if (newName == NULL)
+      return STATUS_INSUFFICIENT_RESOURCES;
+    ZeroMemory(newName, (pos + 1) * sizeof(WCHAR) + renameInfo->FileNameLength +
+                            sizeof(WCHAR));
     RtlCopyMemory(newName, EventContext->Operation.SetFile.FileName,
                   (pos + 1) * sizeof(WCHAR));
     RtlCopyMemory((PCHAR)newName + (pos + 1) * sizeof(WCHAR),
                   renameInfo->FileName, renameInfo->FileNameLength);
   } else {
+    newName = (WCHAR *)malloc(renameInfo->FileNameLength + sizeof(WCHAR));
+    if (newName == NULL)
+      return STATUS_INSUFFICIENT_RESOURCES;
+    ZeroMemory(newName, renameInfo->FileNameLength + sizeof(WCHAR));
     RtlCopyMemory(newName, renameInfo->FileName, renameInfo->FileNameLength);
   }
 
-  if (!DokanOperations->MoveFile)
-    return STATUS_NOT_IMPLEMENTED;
-
-  return DokanOperations->MoveFile(EventContext->Operation.SetFile.FileName,
-                                   newName, renameInfo->ReplaceIfExists,
-                                   FileInfo);
+  status =
+      DokanOperations->MoveFile(EventContext->Operation.SetFile.FileName,
+                                newName, renameInfo->ReplaceIfExists, FileInfo);
+  free(newName);
+  return status;
 }
 
 NTSTATUS
@@ -205,14 +236,15 @@ VOID DispatchSetInformation(HANDLE Handle, PEVENT_CONTEXT EventContext,
   PEVENT_INFORMATION eventInfo;
   PDOKAN_OPEN_INFO openInfo;
   DOKAN_FILE_INFO fileInfo;
-  NTSTATUS status = STATUS_NOT_IMPLEMENTED;
-  ULONG sizeOfEventInfo = sizeof(EVENT_INFORMATION);
+  NTSTATUS status = STATUS_INVALID_PARAMETER;
+  ULONG sizeOfEventInfo = DispatchGetEventInformationLength(0);
 
-  if (EventContext->Operation.SetFile.FileInformationClass ==
-      FileRenameInformation) {
+  if (EventContext->Operation.SetFile.FileInformationClass == FileRenameInformation
+	  || EventContext->Operation.SetFile.FileInformationClass == FileRenameInformationEx) {
     PDOKAN_RENAME_INFORMATION renameInfo = (PDOKAN_RENAME_INFORMATION)(
         (PCHAR)EventContext + EventContext->Operation.SetFile.BufferOffset);
-    sizeOfEventInfo += renameInfo->FileNameLength;
+    sizeOfEventInfo =
+        DispatchGetEventInformationLength(renameInfo->FileNameLength);
   }
 
   CheckFileName(EventContext->Operation.SetFile.FileName);
@@ -236,6 +268,7 @@ VOID DispatchSetInformation(HANDLE Handle, PEVENT_CONTEXT EventContext,
     break;
 
   case FileDispositionInformation:
+  case FileDispositionInformationEx:
     status = DokanSetDispositionInformation(EventContext, &fileInfo,
                                             DokanInstance->DokanOperations);
     break;
@@ -251,11 +284,12 @@ VOID DispatchSetInformation(HANDLE Handle, PEVENT_CONTEXT EventContext,
     break;
 
   case FilePositionInformation:
-    // this case is dealed with by driver
+    // this case is dealt with by the driver
     status = STATUS_NOT_IMPLEMENTED;
     break;
 
   case FileRenameInformation:
+  case FileRenameInformationEx:
     status = DokanSetRenameInformation(EventContext, &fileInfo,
                                        DokanInstance->DokanOperations);
     break;
@@ -266,7 +300,7 @@ VOID DispatchSetInformation(HANDLE Handle, PEVENT_CONTEXT EventContext,
     break;
   default:
     DbgPrint("  unknown FileInformationClass %d\n",
-      EventContext->Operation.SetFile.FileInformationClass);
+             EventContext->Operation.SetFile.FileInformationClass);
     break;
   }
 
@@ -275,24 +309,13 @@ VOID DispatchSetInformation(HANDLE Handle, PEVENT_CONTEXT EventContext,
   eventInfo->BufferLength = 0;
   eventInfo->Status = status;
 
-  if (EventContext->Operation.SetFile.FileInformationClass ==
-      FileDispositionInformation) {
-    if (status == STATUS_SUCCESS) {
-      PFILE_DISPOSITION_INFORMATION dispositionInfo =
-          (PFILE_DISPOSITION_INFORMATION)(
-              (PCHAR)EventContext +
-              EventContext->Operation.SetFile.BufferOffset);
-      eventInfo->Operation.Delete.DeleteOnClose =
-          dispositionInfo->DeleteFile ? TRUE : FALSE;
-      DbgPrint("  dispositionInfo->DeleteFile = %d\n",
-               dispositionInfo->DeleteFile);
-    }
-
-  } else {
-    // notice new file name to driver
-    if (status == STATUS_SUCCESS &&
-        EventContext->Operation.SetFile.FileInformationClass ==
-            FileRenameInformation) {
+  if (status == STATUS_SUCCESS) {
+    if (EventContext->Operation.SetFile.FileInformationClass == FileDispositionInformation ||
+        EventContext->Operation.SetFile.FileInformationClass == FileDispositionInformationEx) {
+      eventInfo->Operation.Delete.DeleteOnClose = fileInfo.DeleteOnClose;
+      DbgPrint("  dispositionInfo->DeleteFile = %d\n", fileInfo.DeleteOnClose);
+    } else if (EventContext->Operation.SetFile.FileInformationClass == FileRenameInformation ||
+               EventContext->Operation.SetFile.FileInformationClass == FileRenameInformationEx) {
       PDOKAN_RENAME_INFORMATION renameInfo = (PDOKAN_RENAME_INFORMATION)(
           (PCHAR)EventContext + EventContext->Operation.SetFile.BufferOffset);
       eventInfo->BufferLength = renameInfo->FileNameLength;
@@ -303,6 +326,7 @@ VOID DispatchSetInformation(HANDLE Handle, PEVENT_CONTEXT EventContext,
 
   DbgPrint("\tDispatchSetInformation result =  %lx\n", status);
 
-  SendEventInformation(Handle, eventInfo, sizeOfEventInfo, DokanInstance);
+  SendEventInformation(Handle, eventInfo, sizeOfEventInfo);
+  ReleaseDokanOpenInfo(eventInfo, &fileInfo, DokanInstance);
   free(eventInfo);
 }

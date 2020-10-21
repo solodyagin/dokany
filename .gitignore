@@ -13,6 +13,8 @@ Win8.1Debug
 Win8.1Release
 Win32
 x64
+ARM
+ARM64
 Debug
 Release
 ipch
@@ -42,3 +44,14 @@ ReleasePS
 /dokan_wix/setup.rpt
 /fstools
 /winfstest
+/dokan_wix/UpgradeLog.htm
+/.vs
+/dokan_wix/.vs
+/sys/dokanfs_msg.h
+/sys/dokanfs_msg.rc
+/sys/MSG00409.bin
+/dokan_wix/Dokan.cab
+/msbuild.log
+/setup.inf
+/setup.rpt
+*.bak

@@ -1,7 +1,8 @@
 /*
   Dokan : user-mode file system library for Windows
 
-  Copyright (C) 2015 - 2016 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
+  Copyright (C) 2017 - 2020 Google, Inc.
+  Copyright (C) 2015 - 2019 Adrien J. <liryna.stark@gmail.com> and Maxime C. <maxime@islog.com>
   Copyright (C) 2007 - 2011 Hiroki Asakawa <info@dokan-dev.net>
 
   http://dokan-dev.github.io
@@ -125,20 +126,34 @@ DokanQueryDirectory(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
   case FileFullDirectoryInformation:
     DDbgPrint("  FileFullDirectoryInformation\n");
     break;
-  case FileNamesInformation:
-    DDbgPrint("  FileNamesInformation\n");
-    break;
   case FileBothDirectoryInformation:
     DDbgPrint("  FileBothDirectoryInformation\n");
     break;
+  case FileNamesInformation:
+    DDbgPrint("  FileNamesInformation\n");
+    break;
   case FileIdBothDirectoryInformation:
     DDbgPrint("  FileIdBothDirectoryInformation\n");
+    break;
+  case FileIdFullDirectoryInformation:
+    DDbgPrint("  FileIdFullDirectoryInformation\n");
+    break;
+  case FileIdExtdDirectoryInformation:
+    DDbgPrint("  FileIdExtdDirectoryInformation\n");
+    break;
+  case FileIdExtdBothDirectoryInformation:
+    DDbgPrint("  FileIdExtdBothDirectoryInformation\n");
     break;
   default:
     DDbgPrint("  unknown FileInfoClass %d\n",
               irpSp->Parameters.QueryDirectory.FileInformationClass);
     break;
   }
+
+  fcb = ccb->Fcb;
+  ASSERT(fcb != NULL);
+
+  OplockDebugRecordMajorFunction(fcb, IRP_MJ_DIRECTORY_CONTROL);
 
   // make a MDL for UserBuffer that can be used later on another thread context
   if (Irp->MdlAddress == NULL) {
@@ -149,8 +164,6 @@ DokanQueryDirectory(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
     flags = DOKAN_MDL_ALLOCATED;
   }
 
-  fcb = ccb->Fcb;
-  ASSERT(fcb != NULL);
   DokanFCBLockRO(fcb);
 
   // size of EVENT_CONTEXT is sum of its length and file name length
@@ -172,15 +185,12 @@ DokanQueryDirectory(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
       ccb->SearchPatternLength =
           irpSp->Parameters.QueryDirectory.FileName->Length;
       ccb->SearchPattern =
-          ExAllocatePool(ccb->SearchPatternLength + sizeof(WCHAR));
+          DokanAllocZero(ccb->SearchPatternLength + sizeof(WCHAR));
 
       if (ccb->SearchPattern == NULL) {
         DokanFCBUnlock(fcb);
         return STATUS_INSUFFICIENT_RESOURCES;
       }
-
-      RtlZeroMemory(ccb->SearchPattern,
-                    ccb->SearchPatternLength + sizeof(WCHAR));
 
       // copy provided search pattern to CCB
       RtlCopyMemory(ccb->SearchPattern,
@@ -288,10 +298,12 @@ DokanNotifyChangeDirectory(__in PDEVICE_OBJECT DeviceObject, __in PIRP Irp) {
     return STATUS_INVALID_PARAMETER;
   }
 
+  DDbgPrint("\tFsRtlNotifyFullChangeDirectory FileName %wZ\n", &fcb->FileName);
+
   DokanFCBLockRO(fcb);
   FsRtlNotifyFullChangeDirectory(
       vcb->NotifySync, &vcb->DirNotifyList, ccb, (PSTRING)&fcb->FileName,
-      irpSp->Flags & SL_WATCH_TREE ? TRUE : FALSE, FALSE,
+      (irpSp->Flags & SL_WATCH_TREE) ? TRUE : FALSE, FALSE,
       irpSp->Parameters.NotifyDirectory.CompletionFilter, Irp, NULL, NULL);
   DokanFCBUnlock(fcb);
 
@@ -323,7 +335,7 @@ VOID DokanCompleteDirectoryControl(__in PIRP_ENTRY IrpEntry,
   // usable buffer size
   bufferLen = irpSp->Parameters.QueryDirectory.Length;
 
-  // DDbgPrint("  !!Returning DirecotyInfo!!\n");
+  // DDbgPrint("  !!Returning DirectoryInfo!!\n");
 
   // buffer is not specified or short of length
   if (bufferLen == 0 || buffer == NULL || bufferLen < EventInfo->BufferLength) {
@@ -336,10 +348,9 @@ VOID DokanCompleteDirectoryControl(__in PIRP_ENTRY IrpEntry,
     // ULONG     orgLen = irpSp->Parameters.QueryDirectory.Length;
 
     //
-    // set the information recieved from user mode
+    // set the information received from user mode
     //
     ASSERT(buffer != NULL);
-
     RtlZeroMemory(buffer, bufferLen);
 
     // DDbgPrint("   copy DirectoryInfo\n");

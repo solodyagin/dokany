@@ -73,10 +73,10 @@ impl_fuse_context::impl_fuse_context(const struct fuse_operations *ops,
                                      void *user_data, bool debug,
                                      unsigned int filemask,
                                      unsigned int dirmask, const char *fsname,
-                                     const char *volname)
+                                     const char *volname, const char *uncname)
     : ops_(*ops), user_data_(user_data), debug_(debug), filemask_(filemask),
       dirmask_(dirmask), fsname_(fsname),
-      volname_(volname) // Use current user data
+      volname_(volname), uncname_(uncname) // Use current user data
 {
   // Reset connection info
   memset(&conn_info_, 0, sizeof(fuse_conn_info));
@@ -194,7 +194,6 @@ int impl_fuse_context::do_create_file(LPCWSTR FileName, DWORD Disposition,
   // Create file?
   if (Disposition != FILE_CREATE && Disposition != FILE_SUPERSEDE &&
       Disposition != FILE_OPEN_IF && Disposition != FILE_OVERWRITE_IF) {
-    SetLastError(ERROR_FILE_NOT_FOUND);
     return -ENOENT; // No, we're trying to open an existing file!
   }
 
@@ -269,45 +268,55 @@ int impl_fuse_context::walk_directory(void *buf, const char *name,
   walk_data *wd = static_cast<walk_data *>(buf);
   WIN32_FIND_DATAW find_data = {0};
 
+  fuse_context* context = fuse_get_context();
+  if(context == nullptr && wd->delegateSetFuseContext != nullptr)
+  {
+    return wd->delegateSetFuseContext(wd->DokanFileInfo,buf, name,stbuf, off);
+  }
+
+  impl_fuse_context* ctx = wd->ctx;
+  PFillFindData p_fill_find_data = wd->delegate;
+  PDOKAN_FILE_INFO DokanFileInfo = wd->DokanFileInfo;
+  std::string dirname = wd->dirname;
+
   utf8_to_wchar_buf(name, find_data.cFileName, MAX_PATH);
   // fix name if wrong encoding
   if (!find_data.cFileName[0]) {
     struct FUSE_STAT stbuf = {0};
     utf8_to_wchar_buf_old(name, find_data.cFileName, MAX_PATH);
     std::string new_name = wchar_to_utf8_cstr(find_data.cFileName);
-    if (wd->ctx->ops_.getattr && wd->ctx->ops_.rename && new_name.length() &&
-        wd->ctx->ops_.getattr(new_name.c_str(), &stbuf) == -ENOENT)
-      wd->ctx->ops_.rename(name, new_name.c_str());
+    if (ctx->ops_.getattr && ctx->ops_.rename && new_name.length() &&
+        ctx->ops_.getattr(new_name.c_str(), &stbuf) == -ENOENT)
+      ctx->ops_.rename(name, new_name.c_str());
   }
   memset(find_data.cAlternateFileName, 0, sizeof(find_data.cAlternateFileName));
 
   struct FUSE_STAT stat = {0};
 
-  /* if (stbuf != NULL)
-    stat = *stbuf;
-  else { */
-    // stat (*stbuf) has only st_ino and st_mode -> request other info with getattr
-    if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) // Special entries
-      stat.st_mode |= S_IFDIR; // TODO: fill directory params here!!!
-    else
-      CHECKED(wd->ctx->ops_.getattr((wd->dirname + name).c_str(), &stat));
-  //}
+  // stat (*stbuf) has only st_ino and st_mode -> request other info with getattr
+  if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {// Special entries
+    stat.st_mode |= S_IFDIR; // TODO: fill directory params here!!!
+  }
+  else if (ctx->ops_.getattr) {
+    CHECKED(ctx->ops_.getattr((dirname + name).c_str(), &stat));
+  }
 
-  if (S_ISLNK(stat.st_mode)) {
+  if (S_ISLNK(stat.st_mode)
+      && ctx->ops_.getattr) {
     std::string resolved;
-    CHECKED(wd->ctx->resolve_symlink(wd->dirname + name, &resolved));
-    CHECKED(wd->ctx->ops_.getattr(resolved.c_str(), &stat));
+    CHECKED(ctx->resolve_symlink(dirname + name, &resolved));
+    CHECKED(ctx->ops_.getattr(resolved.c_str(), &stat));
   }
 
   convertStatlikeBuf(&stat, name, &find_data);
 
   uint32_t attrs = 0xFFFFFFFFu;
-  if (wd->ctx->ops_.win_get_attributes)
-    attrs = wd->ctx->ops_.win_get_attributes((wd->dirname + name).c_str());
+  if (ctx->ops_.win_get_attributes)
+      attrs = ctx->ops_.win_get_attributes((dirname + name).c_str());
   if (attrs != 0xFFFFFFFFu)
     find_data.dwFileAttributes = attrs;
 
-  return wd->delegate(&find_data, wd->DokanFileInfo);
+  return p_fill_find_data(&find_data, DokanFileInfo);
 }
 
 int impl_fuse_context::walk_directory_getdir(fuse_dirh_t hndl, const char *name,
@@ -319,6 +328,7 @@ int impl_fuse_context::walk_directory_getdir(fuse_dirh_t hndl, const char *name,
 
 int impl_fuse_context::find_files(LPCWSTR file_name,
                                   PFillFindData fill_find_data,
+                                  PWalkDirectoryWithSetFuseContext walk_set_fuse_context,
                                   PDOKAN_FILE_INFO dokan_file_info) {
   if ((!ops_.readdir && !ops_.getdir) || !ops_.getattr)
     return -EINVAL;
@@ -332,6 +342,7 @@ int impl_fuse_context::find_files(LPCWSTR file_name,
   if (*fname.rbegin() != '/')
     wd.dirname.append("/");
   wd.delegate = fill_find_data;
+  wd.delegateSetFuseContext = walk_set_fuse_context;
   wd.DokanFileInfo = dokan_file_info;
 
   if (ops_.readdir) {
@@ -424,21 +435,74 @@ int impl_fuse_context::create_directory(LPCWSTR file_name,
   return ops_.mkdir(fname.c_str(), dirmask_);
 }
 
+int impl_fuse_context::readdir_filler_set_has_files(void *buf, const char *name,
+                                      const struct FUSE_STAT *stbuf,
+                                      FUSE_OFF_T off) {
+  bool *has_files = static_cast<bool *>(buf);
+  int ret = 0;
+  if (strcmp(name, ".") && strcmp(name, "..")) {
+    *has_files = true;
+    ret = 1;
+  }
+  return ret;
+}
+
+int impl_fuse_context::getdir_filler_set_has_files(fuse_dirh_t hndl, const char *name,
+                                             int type, ino_t ino) {
+    bool *has_files = reinterpret_cast<bool *>(hndl);
+    int ret = 0;
+    if (readdir_filler_set_has_files(has_files, name, nullptr, 0))
+      ret = -ECANCELED;
+    return ret;
+}
+
+
 int impl_fuse_context::delete_directory(LPCWSTR file_name,
                                         PDOKAN_FILE_INFO dokan_file_info) {
   std::string fname = unixify(wchar_to_utf8_cstr(file_name));
-
-  if (!ops_.getattr)
+  if (!ops_.getattr || !ops_.rmdir || (!ops_.readdir && !ops_.getdir))
     return -EINVAL;
 
   struct FUSE_STAT stbuf = {0};
-  return ops_.getattr(fname.c_str(), &stbuf);
+  int ret = ops_.getattr(fname.c_str(), &stbuf);
+
+  /* TODO: Should we check if the parent-dir is writable and return -EACCESS?
+   * (by using ops_.access or alternatively other means such as getattr)
+   */
+  if (ret < 0)
+    return ret;
+
+  bool has_files = false;
+  if (ops_.readdir) {
+    impl_file_handle *hndl = reinterpret_cast<impl_file_handle *>(dokan_file_info->Context);
+    fuse_file_info *p_finfo = nullptr;
+    fuse_file_info finfo;
+    if (hndl != nullptr) {
+      finfo = hndl->make_finfo();
+      p_finfo = &finfo;
+    }
+    ret = ops_.readdir(fname.c_str(), &has_files, &readdir_filler_set_has_files, 0, p_finfo);
+  } else {
+    ret = ops_.getdir(fname.c_str(), reinterpret_cast<fuse_dirh_t>(&has_files), &getdir_filler_set_has_files);
+    /* We only propagate the return value of getdir() when has_files is set.
+     * To avoid reading the whole directory, we return an error in our callback
+     * and set has_files after we encountered the first regular directory entry.
+     * It is not exactly clear what getdir() is supposed to return in this case,
+     * but given that we return -ENOTEMPTY anyways, we do not need to care.
+     */
+  }
+  if (has_files) {
+    ret = -ENOTEMPTY;
+  }
+
+  return ret;
 }
 
 win_error impl_fuse_context::create_file(LPCWSTR file_name, DWORD access_mode,
                                          DWORD share_mode,
                                          DWORD creation_disposition,
                                          DWORD flags_and_attributes,
+                                         ULONG CreateOptions,
                                          PDOKAN_FILE_INFO dokan_file_info) {
   std::string fname = unixify(wchar_to_utf8_cstr(file_name));
   dokan_file_info->Context = 0;
@@ -465,6 +529,8 @@ win_error impl_fuse_context::create_file(LPCWSTR file_name, DWORD access_mode,
       // Existing directory
       // TODO: add access control
       dokan_file_info->IsDirectory = TRUE;
+      if (CreateOptions & FILE_NON_DIRECTORY_FILE)
+        return -ENOENT;
       return do_open_dir(file_name, dokan_file_info);
     } else {
       // Existing file
@@ -483,16 +549,17 @@ win_error impl_fuse_context::create_file(LPCWSTR file_name, DWORD access_mode,
           return -EINVAL;
         CHECKED(ops_.truncate(fname.c_str(), 0));
       } else if (creation_disposition == FILE_CREATE) {
-        SetLastError(ERROR_FILE_EXISTS);
         return win_error(STATUS_OBJECT_NAME_COLLISION, true);
       }
 
-      if (creation_disposition == FILE_OVERWRITE_IF ||
-          creation_disposition == FILE_OPEN_IF) {
-          SetLastError(ERROR_ALREADY_EXISTS);
+      long res = do_open_file(file_name, share_mode, access_mode, dokan_file_info);
+      if (res == 0 &&
+        (creation_disposition == FILE_OVERWRITE_IF ||
+        creation_disposition == FILE_OPEN_IF)) {
+        return win_error(STATUS_OBJECT_NAME_COLLISION, true);
       }
 
-      return do_open_file(file_name, share_mode, access_mode, dokan_file_info);
+      return res;
     }
   }
 }
@@ -538,13 +605,15 @@ int impl_fuse_context::read_file(LPCWSTR /*file_name*/, LPVOID buffer,
   CHECKED(cast_from_longlong(offset, &off));
   fuse_file_info finfo(hndl->make_finfo());
 
+  std::string file_name = hndl->get_name();
   DWORD total_read = 0;
   while (total_read < num_bytes_to_read) {
     DWORD to_read = num_bytes_to_read - total_read;
     if (to_read > MAX_READ_SIZE)
       to_read = MAX_READ_SIZE;
 
-    int res = ops_.read(hndl->get_name().c_str(), static_cast<char *>(buffer), to_read, off,
+    int res = ops_.read(file_name.c_str(), static_cast<char *>(buffer), to_read,
+                        off,
                         &finfo);
     if (res < 0)
       return res; // Error
@@ -579,6 +648,12 @@ int impl_fuse_context::write_file(LPCWSTR /*file_name*/, LPCVOID buffer,
   if (hndl->is_dir())
     return -EACCES;
 
+  if (offset < 0) {
+	  struct FUSE_STAT stat;
+	  if (0 == ops_.getattr(hndl->get_name().c_str(), &stat)) {
+		  offset = stat.st_size;
+	  }
+  }
   // Clip the maximum write size
   if (num_bytes_to_write > conn_info_.max_write)
     num_bytes_to_write = conn_info_.max_write;
@@ -965,7 +1040,9 @@ int impl_file_locks::get_file(const std::string &name, bool is_dir,
   // check previous files with same names
   DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
   for (impl_file_handle *p = lock->first; p; p = p->next_file)
-    share &= p->shared_mode_;
+	  if (file.get() != p) {
+		  share &= p->shared_mode_;
+	  }
   if ((required_share(access_mode) | share) != share) {
     file.reset();
     res = -EACCES;

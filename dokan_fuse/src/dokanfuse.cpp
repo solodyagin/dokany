@@ -33,6 +33,18 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason,
   return TRUE;
 }
 
+static int WalkDirectoryWithSetFuseContext(PDOKAN_FILE_INFO DokanFileInfo, void *buf, const char *name,
+    const struct FUSE_STAT *stbuf,
+    FUSE_OFF_T off)
+{
+    impl_fuse_context *impl = the_impl;
+    if (impl->debug())
+        FPRINTF(stderr, "WalkDirectoryWithSetFuseContext on thread " PRIuDWORD "\n", GetCurrentThreadId());
+
+    impl_chain_guard guard(impl, DokanFileInfo->ProcessId);
+    return impl->walk_directory(buf, name, stbuf, off);
+}
+
 static NTSTATUS DOKAN_CALLBACK
 FuseFindFiles(LPCWSTR FileName,
               PFillFindData FillFindData, // function pointer
@@ -43,7 +55,7 @@ FuseFindFiles(LPCWSTR FileName,
 
   impl_chain_guard guard(impl, DokanFileInfo->ProcessId);
   return errno_to_ntstatus_error(
-      impl->find_files(FileName, FillFindData, DokanFileInfo));
+      impl->find_files(FileName, FillFindData, &WalkDirectoryWithSetFuseContext, DokanFileInfo));
 }
 
 static void DOKAN_CALLBACK FuseCleanup(LPCWSTR FileName,
@@ -197,7 +209,7 @@ FuseCreateFile(LPCWSTR FileName, PDOKAN_IO_SECURITY_CONTEXT SecurityContext,
   }
 
   return impl->create_file(FileName, DesiredAccess, ShareAccess,
-                           CreateDisposition, FileAttributes,
+                           CreateDisposition, FileAttributes, CreateOptions,
                            DokanFileInfo);
 }
 
@@ -432,74 +444,6 @@ static NTSTATUS DOKAN_CALLBACK FuseUnmounted(PDOKAN_FILE_INFO DokanFileInfo) {
   return errno_to_ntstatus_error(impl->unmounted(DokanFileInfo));
 }
 
-static NTSTATUS DOKAN_CALLBACK
-FuseGetFileSecurity(LPCWSTR FileName, PSECURITY_INFORMATION SecurityInformation,
-                    PSECURITY_DESCRIPTOR SecurityDescriptor, ULONG BufferLength,
-                    PULONG LengthNeeded, PDOKAN_FILE_INFO DokanFileInfo) {
-  impl_fuse_context *impl = the_impl;
-  if (impl->debug())
-    FPRINTF(stderr, "GetFileSecurity: " PRIxDWORD "\n", *SecurityInformation);
-
-  BY_HANDLE_FILE_INFORMATION byHandleFileInfo;
-  ZeroMemory(&byHandleFileInfo, sizeof(BY_HANDLE_FILE_INFORMATION));
-
-  int ret;
-  {
-    impl_chain_guard guard(impl, DokanFileInfo->ProcessId);
-    ret =
-        impl->get_file_information(FileName, &byHandleFileInfo, DokanFileInfo);
-  }
-
-  if (0 != ret) {
-    return errno_to_ntstatus_error(ret);
-  }
-
-  if (byHandleFileInfo.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-    // We handle directories for the Explorer's
-    // context menu. (New Folder, ...)
-
-    // Authenticated users rights
-    PSECURITY_DESCRIPTOR SecurityDescriptorTmp = nullptr;
-    ULONG Size = 0;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptor(
-            "D:PAI(A;OICI;FA;;;AU)", SDDL_REVISION_1, &SecurityDescriptorTmp,
-            &Size)) {
-      return STATUS_NOT_IMPLEMENTED;
-    }
-
-    LPTSTR pStringBuffer = nullptr;
-    if (!ConvertSecurityDescriptorToStringSecurityDescriptor(
-            SecurityDescriptorTmp, SDDL_REVISION_1, *SecurityInformation,
-            &pStringBuffer, nullptr)) {
-      return STATUS_NOT_IMPLEMENTED;
-    }
-
-    LocalFree(SecurityDescriptorTmp);
-    SecurityDescriptorTmp = nullptr;
-    Size = 0;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptor(
-            pStringBuffer, SDDL_REVISION_1, &SecurityDescriptorTmp, &Size)) {
-      return STATUS_NOT_IMPLEMENTED;
-    }
-
-    if (Size > BufferLength) {
-      *LengthNeeded = Size;
-      return STATUS_BUFFER_OVERFLOW;
-    }
-
-    memcpy(SecurityDescriptor, SecurityDescriptorTmp, Size);
-    *LengthNeeded = Size;
-
-    if (pStringBuffer != nullptr)
-      LocalFree(pStringBuffer);
-    if (SecurityDescriptorTmp != nullptr)
-      LocalFree(SecurityDescriptorTmp);
-
-    return STATUS_SUCCESS;
-  }
-  return STATUS_NOT_IMPLEMENTED;
-}
-
 int fuse_interrupted(void) {
   return 0; // TODO: fix this
 }
@@ -527,7 +471,7 @@ static DOKAN_OPERATIONS dokanOperations = {
     GetVolumeInformation,
     FuseMounted,
     FuseUnmounted,
-    FuseGetFileSecurity,
+    nullptr, // FuseGetFileSecurity
     nullptr, // SetFileSecurity
 };
 
@@ -548,7 +492,7 @@ int do_fuse_loop(struct fuse *fs, bool mt) {
 
   impl_fuse_context impl(&fs->ops, fs->user_data, fs->conf.debug != 0,
                          fileumask, dirumask, fs->conf.fsname,
-                         fs->conf.volname);
+                         fs->conf.volname, fs->conf.uncname);
 
   // Parse Dokan options
   PDOKAN_OPTIONS dokanOptions = static_cast<PDOKAN_OPTIONS>(malloc(sizeof(DOKAN_OPTIONS)));
@@ -556,21 +500,40 @@ int do_fuse_loop(struct fuse *fs, bool mt) {
     return -1;
   }
   ZeroMemory(dokanOptions, sizeof(DOKAN_OPTIONS));
-  dokanOptions->Options |=
-      fs->conf.networkDrive ? DOKAN_OPTION_NETWORK : DOKAN_OPTION_REMOVABLE;
+
   dokanOptions->GlobalContext = reinterpret_cast<ULONG64>(&impl);
+  if (fs->conf.mountManager)
+    dokanOptions->Options |= DOKAN_OPTION_MOUNT_MANAGER;
+  else {
+    dokanOptions->Options |=
+        fs->conf.networkDrive ? DOKAN_OPTION_NETWORK : DOKAN_OPTION_REMOVABLE;
+    wchar_t uncName[MAX_PATH + 1];
+    if (fs->conf.networkDrive && fs->conf.uncname) {
+      mbstowcs(uncName, fs->conf.uncname, MAX_PATH);
+      dokanOptions->UNCName = uncName;
+    }
+  }
 
   wchar_t mount[MAX_PATH + 1];
-  mbstowcs(mount, fs->ch->mountpoint.c_str(), MAX_PATH);
+  if (utf8_to_wchar_buf(fs->ch->mountpoint.c_str(), mount, MAX_PATH) == static_cast<size_t>(-1)) {
+    free(dokanOptions);
+    return -1;
+  }
 
   dokanOptions->Version = DOKAN_VERSION;
   dokanOptions->MountPoint = mount;
   dokanOptions->ThreadCount = mt ? FUSE_THREAD_COUNT : 1;
   dokanOptions->Timeout = fs->conf.timeoutInSec * 1000;
+  dokanOptions->AllocationUnitSize = fs->conf.allocationUnitSize;
+  dokanOptions->SectorSize = fs->conf.sectorSize;
 
   // Debug
   if (fs->conf.debug)
     dokanOptions->Options |= DOKAN_OPTION_DEBUG | DOKAN_OPTION_STDERR;
+
+  // Read only
+  if (fs->conf.readonly)
+    dokanOptions->Options |= DOKAN_OPTION_WRITE_PROTECT;
 
   // Load Dokan DLL
   if (!fs->ch->init()) {
@@ -630,14 +593,20 @@ static const struct fuse_opt fuse_lib_opts[] = {
     FUSE_OPT_KEY("-d", FUSE_OPT_KEY_KEEP),
     FUSE_LIB_OPT("debug", debug, 1),
     FUSE_LIB_OPT("-d", debug, 1),
+    FUSE_LIB_OPT("rdonly", readonly, 1),
+    FUSE_LIB_OPT("-r", readonly, 1),
     FUSE_LIB_OPT("umask=%o", umask, 0),
     FUSE_LIB_OPT("fileumask=%o", fileumask, 0),
     FUSE_LIB_OPT("dirumask=%o", dirumask, 0),
     FUSE_LIB_OPT("fsname=%s", fsname, 0),
     FUSE_LIB_OPT("volname=%s", volname, 0),
+    FUSE_LIB_OPT("uncname=%s", uncname, 0),
     FUSE_LIB_OPT("setsignals=%s", setsignals, 0),
     FUSE_LIB_OPT("daemon_timeout=%d", timeoutInSec, 0),
+    FUSE_LIB_OPT("alloc_unit_size=%lu", allocationUnitSize, 0),
+    FUSE_LIB_OPT("sector_size=%lu", sectorSize, 0),
     FUSE_LIB_OPT("-n", networkDrive, 1),
+    FUSE_LIB_OPT("-m", mountManager, 1),
     FUSE_OPT_END};
 
 static void fuse_lib_help(void) {
@@ -648,9 +617,13 @@ static void fuse_lib_help(void) {
       "    -o dirumask=M          set directory permissions (octal)\n"
       "    -o fsname=M            set filesystem name\n"
       "    -o volname=M           set volume name\n"
+      "    -o uncname=M           set UNC name\n"
       "    -o setsignals=M        set signal usage (1 to use)\n"
       "    -o daemon_timeout=M    set timeout in seconds\n"
+      "    -o alloc_unit_size=M   set allocation unit size\n"
+      "    -o sector_size=M       set sector size\n"
       "    -n                     use network drive\n"
+      "    -m                     use mount manager\n"
       "\n");
 }
 
@@ -707,7 +680,9 @@ void fuse_unmount(const char *mountpoint, struct fuse_chan *ch) {
   // Unmount attached FUSE filesystem
   if (ch->ResolvedDokanRemoveMountPoint) {
     wchar_t wmountpoint[MAX_PATH + 1];
-    mbstowcs(wmountpoint, mountpoint, MAX_PATH);
+    if (utf8_to_wchar_buf(mountpoint, wmountpoint, MAX_PATH) == static_cast<size_t>(-1)) {
+      return;
+    }
     wchar_t &last = wmountpoint[wcslen(wmountpoint) - 1];
     if (last == L'\\' || last == L'/')
       last = L'\0';
